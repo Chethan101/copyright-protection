@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+python-multipart
+passlib
+bcrypt
+pyjwt
+opencv-python
+pywavelets
+pillow
+numpy
+imagehash
+requests
