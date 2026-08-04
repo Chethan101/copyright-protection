@@ -132,6 +132,7 @@ def embed_watermark(image_path: str, watermark_bits: str, output_path: str) -> b
     # Reconstruct
     Y_wm  = pywt.idwt2((LL, (HL, LH, HH)), 'haar')
     yuv[:, :, 0] = np.clip(Y_wm, 0, 255)
+    result = cv2.cvtColor(yuv.astype(np.uint8), cv2.COLOR_YUV2BGR)
 
     # Save at high quality depending on file extension
     ext = os.path.splitext(output_path)[1].lower()
@@ -192,23 +193,63 @@ def extract_watermark(image_path: str, watermark_len_bits: int) -> str:
 # ── ORB similarity ────────────────────────────────────────────────────────────
 
 def calculate_orb_similarity(img1_path: str, img2_path: str) -> float:
-    """ORB feature-point matching for structural similarity."""
+    """
+    ORB feature-point matching with RANSAC Homography to detect screen photos,
+    re-captured photos from mobile devices, crops, and perspective tilts.
+    """
     img1 = cv2.imread(img1_path, cv2.IMREAD_GRAYSCALE)
     img2 = cv2.imread(img2_path, cv2.IMREAD_GRAYSCALE)
 
     if img1 is None or img2 is None:
         return 0.0
 
-    orb = cv2.ORB_create(nfeatures=1000)
+    # Normalise dimensions for consistent feature density
+    h1, w1 = img1.shape[:2]
+    h2, w2 = img2.shape[:2]
+    if max(h1, w1) > 1000:
+        scale = 1000.0 / max(h1, w1)
+        img1 = cv2.resize(img1, (int(w1 * scale), int(h1 * scale)))
+    if max(h2, w2) > 1000:
+        scale = 1000.0 / max(h2, w2)
+        img2 = cv2.resize(img2, (int(w2 * scale), int(h2 * scale)))
+
+    orb = cv2.ORB_create(nfeatures=1500, scoreType=cv2.ORB_FAST_SCORE)
     kp1, des1 = orb.detectAndCompute(img1, None)
     kp2, des2 = orb.detectAndCompute(img2, None)
 
     if des1 is None or des2 is None or len(kp1) < 5 or len(kp2) < 5:
         return 0.0
 
-    bf      = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = sorted(bf.match(des1, des2), key=lambda x: x.distance)
+    # KNN matching with Lowe's ratio test (robust against glare, lighting, and camera noise)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    matches = bf.knnMatch(des1, des2, k=2)
 
-    min_kp       = min(len(kp1), len(kp2))
-    good_matches = len([m for m in matches if m.distance < 50])
-    return min(100.0, (good_matches / min_kp) * 100 * 3)
+    good_matches = []
+    for m_pair in matches:
+        if len(m_pair) == 2:
+            m, n = m_pair
+            if m.distance < 0.75 * n.distance:
+                good_matches.append(m)
+
+    min_kp = min(len(kp1), len(kp2))
+    if min_kp == 0:
+        return 0.0
+
+    # Feature match score based on good match ratio
+    match_ratio = (len(good_matches) / min_kp) * 100.0
+    score = min(100.0, match_ratio * 4.0)
+
+    # RANSAC Homography check (confirms geometric structure even if photo taken from mobile screen)
+    if len(good_matches) >= 8:
+        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if mask is not None:
+            inliers = int(np.sum(mask))
+            inlier_ratio = (inliers / len(good_matches)) * 100.0
+            if inliers >= 8:
+                homography_score = min(99.0, max(75.0, inlier_ratio * 1.2 + inliers * 1.5))
+                score = max(score, homography_score)
+
+    return round(float(score), 2)

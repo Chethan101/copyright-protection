@@ -36,14 +36,23 @@ export default function RegisterCopyright() {
     setLoading(true);
     setError('');
     try {
+      const token = localStorage.getItem('registry_token');
+      if (!token) {
+        window.location.href = '/login';
+        return;
+      }
       const formData = new FormData();
       formData.append('file', file);
-      const token = localStorage.getItem('registry_token');
       const res = await axios.post('http://127.0.0.1:8000/api/images/register', formData, {
         headers: { 'Authorization': `Bearer ${token}` }
       });
       setResult(res.data);
     } catch (err: any) {
+      if (err.response?.status === 401) {
+        localStorage.removeItem('registry_token');
+        window.location.href = '/login';
+        return;
+      }
       setError(err.response?.data?.detail || 'Registration failed. Please try again.');
     } finally {
       setLoading(false);

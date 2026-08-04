@@ -161,11 +161,11 @@ async def verify_watermark(file: UploadFile = File(...), db: Session = Depends(a
             except Exception:
                 pass
 
-            # Tertiary: ORB structural feature matching against original
+            # Tertiary: ORB structural feature matching against original (handles mobile photo recaptures & screen photos)
             orig_path = os.path.join(ORIGINAL_DIR, img.original_path)
             if os.path.exists(orig_path):
                 orb_score = watermark_engine.calculate_orb_similarity(temp_path, orig_path)
-                if orb_score > 40.0 and orb_score > confidence:
+                if orb_score > 25.0 and orb_score > confidence:
                     matched_image = img
                     confidence = orb_score
 
@@ -173,7 +173,7 @@ async def verify_watermark(file: UploadFile = File(...), db: Session = Depends(a
             wm_path = os.path.join(WATERMARKED_DIR, img.watermarked_path)
             if os.path.exists(wm_path):
                 orb_score_wm = watermark_engine.calculate_orb_similarity(temp_path, wm_path)
-                if orb_score_wm > 50.0 and orb_score_wm > confidence:
+                if orb_score_wm > 25.0 and orb_score_wm > confidence:
                     matched_image = img
                     confidence = orb_score_wm
 
