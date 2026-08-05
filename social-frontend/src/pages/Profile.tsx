@@ -64,7 +64,11 @@ export default function Profile() {
         <div className="profile-grid" style={{ marginTop: 3 }}>
           {data.posts.map((p: any) => (
             <div key={p.id} style={{ position: 'relative', aspectRatio: '1', overflow: 'hidden', background: 'var(--surface2)' }}>
-              <img src={p.image_url} alt="" className="profile-grid-img" />
+              {['.mp4', '.mov', '.webm', '.avi', '.mkv'].some(ext => p.image_url.toLowerCase().endsWith(ext)) ? (
+                <video src={p.image_url} className="profile-grid-img" muted />
+              ) : (
+                <img src={p.image_url} alt="" className="profile-grid-img" />
+              )}
               <div style={{
                 position: 'absolute', inset: 0, background: 'rgba(0,0,0,0)',
                 display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 20,

@@ -63,8 +63,12 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
         <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text)', fontSize: 20, padding: '0 4px' }}>•••</button>
       </div>
 
-      {/* Image */}
-      <img src={post.image_url} alt="post" className="post-image" />
+      {/* Media: Image or Video */}
+      {['.mp4', '.mov', '.webm', '.avi', '.mkv'].some(ext => post.image_url.toLowerCase().endsWith(ext)) ? (
+        <video src={post.image_url} controls loop muted className="post-image" />
+      ) : (
+        <img src={post.image_url} alt="post" className="post-image" />
+      )}
 
       {/* Action buttons */}
       <div className="post-actions">

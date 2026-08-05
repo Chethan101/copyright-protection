@@ -19,6 +19,7 @@ Technique:
 """
 
 import os
+import shutil
 import cv2
 import numpy as np
 import pywt
@@ -76,26 +77,19 @@ def _block_texture(block):
 
 # ── Embed ─────────────────────────────────────────────────────────────────────
 
-def embed_watermark(image_path: str, watermark_bits: str, output_path: str) -> bool:
+def embed_watermark_frame(img: np.ndarray, watermark_bits: str) -> np.ndarray:
     """
-    Embed watermark invisibly into the Y (luminance) channel only.
-    Uses HVS-adaptive alpha so flat regions are barely touched.
+    In-memory frame watermarking (0 disk I/O).
     """
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError(f"Cannot read image: {image_path}")
-
-    # Ensure dimensions are multiples of 16 (DWT + 8×8 DCT requirement)
     h, w = img.shape[:2]
     new_h = max(64, (h // 16) * 16)
     new_w = max(64, (w // 16) * 16)
-    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    if (new_h, new_w) != (h, w):
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-    # Work in YCbCr — embed ONLY in Y (luminance)
     yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV).astype(np.float32)
     Y = yuv[:, :, 0]
 
-    # Single-level DWT
     LL, (HL, LH, HH) = pywt.dwt2(Y, 'haar')
 
     bits     = watermark_bits
@@ -107,7 +101,6 @@ def embed_watermark(image_path: str, watermark_bits: str, output_path: str) -> b
         for j in range(0, cols - 7, 8):
             block = LL[i:i+8, j:j+8].copy()
 
-            # HVS-adaptive strength
             tex   = _block_texture(block)
             alpha = ALPHA_MIN + tex * (ALPHA_MAX - ALPHA_MIN)
 
@@ -115,24 +108,32 @@ def embed_watermark(image_path: str, watermark_bits: str, output_path: str) -> b
             bit       = int(bits[bit_idx % bits_len])
             bit_idx  += 1
 
-            # Embed into each chosen mid-frequency position
             for (r, c) in EMBED_POSITIONS:
                 coeff = dct_block[r, c]
                 if bit == 1:
-                    # Force coeff clearly positive
                     if coeff <= alpha:
                         dct_block[r, c] = alpha + abs(coeff) * 0.1
                 else:
-                    # Force coeff clearly negative
                     if coeff >= -alpha:
                         dct_block[r, c] = -(alpha + abs(coeff) * 0.1)
 
             LL[i:i+8, j:j+8] = apply_idct_2d(dct_block)
 
-    # Reconstruct
     Y_wm  = pywt.idwt2((LL, (HL, LH, HH)), 'haar')
     yuv[:, :, 0] = np.clip(Y_wm, 0, 255)
-    result = cv2.cvtColor(yuv.astype(np.uint8), cv2.COLOR_YUV2BGR)
+    return cv2.cvtColor(yuv.astype(np.uint8), cv2.COLOR_YUV2BGR)
+
+
+def embed_watermark(image_path: str, watermark_bits: str, output_path: str) -> bool:
+    """
+    Embed watermark invisibly into the Y (luminance) channel only.
+    Uses HVS-adaptive alpha so flat regions are barely touched.
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError(f"Cannot read image: {image_path}")
+
+    result = embed_watermark_frame(img, watermark_bits)
 
     # Save at high quality depending on file extension
     ext = os.path.splitext(output_path)[1].lower()
@@ -147,26 +148,21 @@ def embed_watermark(image_path: str, watermark_bits: str, output_path: str) -> b
 
 # ── Extract ───────────────────────────────────────────────────────────────────
 
-def extract_watermark(image_path: str, watermark_len_bits: int) -> str:
+def extract_watermark_frame(img: np.ndarray, watermark_len_bits: int) -> str:
     """
-    Extract watermark bits using majority-vote across all LL DWT blocks.
-    Robust even after JPEG recompression, mild resize, or brightness edits.
+    In-memory frame watermark extraction (0 disk I/O).
     """
-    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-    if img is None:
-        return '0' * watermark_len_bits
-
     h, w = img.shape[:2]
     new_h = max(64, (h // 16) * 16)
     new_w = max(64, (w // 16) * 16)
-    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    if (new_h, new_w) != (h, w):
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
     yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV).astype(np.float32)
     Y   = yuv[:, :, 0]
 
     LL, _ = pywt.dwt2(Y, 'haar')
 
-    # votes[i] = [count_0, count_1]
     votes = [[0, 0] for _ in range(watermark_len_bits)]
     idx   = 0
 
@@ -178,7 +174,6 @@ def extract_watermark(image_path: str, watermark_len_bits: int) -> str:
             pos       = idx % watermark_len_bits
             idx      += 1
 
-            # Count positive vs negative votes across embed positions
             ones  = sum(1 for (r, c) in EMBED_POSITIONS if dct_block[r, c] > 0)
             zeros = len(EMBED_POSITIONS) - ones
 
@@ -188,6 +183,18 @@ def extract_watermark(image_path: str, watermark_len_bits: int) -> str:
                 votes[pos][0] += 1
 
     return ''.join('1' if v[1] > v[0] else '0' for v in votes)
+
+
+def extract_watermark(image_path: str, watermark_len_bits: int) -> str:
+    """
+    Extract watermark bits using majority-vote across all LL DWT blocks.
+    Robust even after JPEG recompression, mild resize, or brightness edits.
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if img is None:
+        return '0' * watermark_len_bits
+
+    return extract_watermark_frame(img, watermark_len_bits)
 
 
 # ── ORB similarity ────────────────────────────────────────────────────────────
@@ -253,3 +260,106 @@ def calculate_orb_similarity(img1_path: str, img2_path: str) -> float:
                 score = max(score, homography_score)
 
     return round(float(score), 2)
+
+
+# ── Video Support ─────────────────────────────────────────────────────────────
+
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv'}
+
+def is_video_file(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+def embed_video_watermark(video_path: str, watermark_bits: str, output_path: str) -> bool:
+    """
+    Ultra-fast in-memory frame-by-frame DWT-DCT watermarking for videos (0 disk I/O).
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video file: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    new_w = max(64, (w // 16) * 16)
+    new_h = max(64, (h // 16) * 16)
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (new_w, new_h))
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            wm_frame = embed_watermark_frame(frame, watermark_bits)
+            out.write(wm_frame)
+    finally:
+        cap.release()
+        out.release()
+
+    return True
+
+def extract_video_watermark(video_path: str, watermark_len_bits: int) -> str:
+    """
+    Ultra-fast in-memory watermark extraction by sampling keyframes (0 disk I/O).
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return '0' * watermark_len_bits
+
+    fps = int(cap.get(cv2.CAP_PROP_FPS) or 24)
+    step = max(1, fps)  # Sample 1 frame per second
+    
+    extracted_strings = []
+    frame_idx = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_idx % step == 0:
+                b_str = extract_watermark_frame(frame, watermark_len_bits)
+                if b_str:
+                    extracted_strings.append(b_str)
+            frame_idx += 1
+    finally:
+        cap.release()
+
+    if not extracted_strings:
+        return '0' * watermark_len_bits
+
+    final_bits = ""
+    for i in range(watermark_len_bits):
+        ones = sum(1 for s in extracted_strings if i < len(s) and s[i] == '1')
+        zeros = len(extracted_strings) - ones
+        final_bits += '1' if ones >= zeros else '0'
+
+    return final_bits
+
+def get_video_perceptual_hash(video_path: str) -> str:
+    """Ultra-fast in-memory perceptual hash of video keyframe (0 disk I/O)."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return get_perceptual_hash(video_path)
+
+    ret, frame = cap.read()
+    cap.release()
+    if ret and frame is not None:
+        pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        return str(imagehash.phash(pil_img, hash_size=16))
+
+    return get_perceptual_hash(video_path)
+
+def extract_keyframe(video_path: str, output_image_path: str) -> bool:
+    """Extracts first frame of video for ORB/thumbnail matching."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return False
+    ret, frame = cap.read()
+    cap.release()
+    if ret and frame is not None:
+        cv2.imwrite(output_image_path, frame)
+        return True
+    return False

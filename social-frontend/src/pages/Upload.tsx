@@ -74,11 +74,11 @@ export default function Upload({ onClose }: { onClose: () => void }) {
             onDragOver={e => e.preventDefault()} onDrop={handleDrop}
             onClick={() => fileRef.current?.click()}
           >
-            <input type="file" ref={fileRef} accept="image/*" className="hidden" onChange={e => e.target.files?.[0] && handleFile(e.target.files[0])} style={{ display: 'none' }} />
+            <input type="file" ref={fileRef} accept="image/*,video/*" className="hidden" onChange={e => e.target.files?.[0] && handleFile(e.target.files[0])} style={{ display: 'none' }} />
             <svg width="80" height="80" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" style={{ margin: '0 auto 24px', display: 'block', opacity: 0.6 }}>
               <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>
             </svg>
-            <p style={{ fontSize: 22, fontWeight: 300, marginBottom: 16 }}>Drag photos here</p>
+            <p style={{ fontSize: 22, fontWeight: 300, marginBottom: 16 }}>Drag photos or videos here</p>
             <button style={{ background: 'var(--blue)', color: 'white', border: 'none', padding: '10px 20px', borderRadius: 8, fontWeight: 700, fontSize: 14, cursor: 'pointer' }}>
               Select from computer
             </button>
@@ -88,7 +88,11 @@ export default function Upload({ onClose }: { onClose: () => void }) {
         {/* Caption step */}
         {step === 'caption' && (
           <div style={{ display: 'flex', minHeight: 320 }}>
-            <img src={preview} alt="" style={{ width: 260, objectFit: 'cover', borderRadius: '0 0 0 16px' }} />
+            {file?.type.startsWith('video/') ? (
+              <video src={preview} controls autoPlay loop muted style={{ width: 260, objectFit: 'cover', borderRadius: '0 0 0 16px' }} />
+            ) : (
+              <img src={preview} alt="" style={{ width: 260, objectFit: 'cover', borderRadius: '0 0 0 16px' }} />
+            )}
             <div style={{ flex: 1, padding: 16, display: 'flex', flexDirection: 'column' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
                 <div className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>

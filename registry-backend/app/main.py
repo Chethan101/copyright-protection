@@ -67,20 +67,28 @@ async def register_image(file: UploadFile = File(...), current_user: models.User
     with open(original_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
-    image_hash = watermark_engine.get_perceptual_hash(original_path)
+    is_video = watermark_engine.is_video_file(original_path)
+    if is_video:
+        image_hash = watermark_engine.get_video_perceptual_hash(original_path)
+    else:
+        image_hash = watermark_engine.get_perceptual_hash(original_path)
     
     # Check if already registered in DB first
     existing = db.query(models.ImageRecord).filter(models.ImageRecord.image_hash == image_hash).first()
     if existing:
         os.remove(original_path)
-        raise HTTPException(status_code=400, detail="Image already registered")
+        raise HTTPException(status_code=400, detail="Image or video already registered")
 
     # Generate watermark_id FIRST so it's consistent in both DB and blockchain
     watermark_id = str(uuid.uuid4())[:8]
     watermark_bits = watermark_engine.str_to_binary(watermark_id)
     output_filename = f"wm_{current_user.id}_{uuid.uuid4().hex[:8]}_{file.filename}"
     output_path = os.path.join(WATERMARKED_DIR, output_filename)
-    watermark_engine.embed_watermark(original_path, watermark_bits, output_path)
+    
+    if is_video:
+        watermark_engine.embed_video_watermark(original_path, watermark_bits, output_path)
+    else:
+        watermark_engine.embed_watermark(original_path, watermark_bits, output_path)
 
     # Try blockchain registration with correct watermark_id
     tx_hash_hex = f"0x{uuid.uuid4().hex}{uuid.uuid4().hex}"
@@ -127,13 +135,23 @@ async def verify_watermark(file: UploadFile = File(...), db: Session = Depends(a
     confidence = 0.0
 
     try:
-        # Step 1: Extract watermark ID from uploaded image (8 chars = 64 bits)
         WATERMARK_BITS = 8 * 8  # 8 ASCII chars × 8 bits each
-        extracted_bits = watermark_engine.extract_watermark(temp_path, WATERMARK_BITS)
-        extracted_wid = watermark_engine.binary_to_str(extracted_bits)
+        is_video = watermark_engine.is_video_file(temp_path)
 
-        # Step 2: Perceptual hash of uploaded image
-        uploaded_phash = watermark_engine.imagehash.hex_to_hash(watermark_engine.get_perceptual_hash(temp_path))
+        # Step 1: Extract watermark ID
+        if is_video:
+            extracted_bits = watermark_engine.extract_video_watermark(temp_path, WATERMARK_BITS)
+            uploaded_phash_str = watermark_engine.get_video_perceptual_hash(temp_path)
+            kf_path = temp_path + "_keyframe.jpg"
+            watermark_engine.extract_keyframe(temp_path, kf_path)
+            orb_test_path = kf_path if os.path.exists(kf_path) else temp_path
+        else:
+            extracted_bits = watermark_engine.extract_watermark(temp_path, WATERMARK_BITS)
+            uploaded_phash_str = watermark_engine.get_perceptual_hash(temp_path)
+            orb_test_path = temp_path
+
+        extracted_wid = watermark_engine.binary_to_str(extracted_bits)
+        uploaded_phash = watermark_engine.imagehash.hex_to_hash(uploaded_phash_str)
 
         all_images = db.query(models.ImageRecord).all()
 
@@ -161,10 +179,19 @@ async def verify_watermark(file: UploadFile = File(...), db: Session = Depends(a
             except Exception:
                 pass
 
-            # Tertiary: ORB structural feature matching against original (handles mobile photo recaptures & screen photos)
+            # Tertiary: ORB structural feature matching against original
             orig_path = os.path.join(ORIGINAL_DIR, img.original_path)
             if os.path.exists(orig_path):
-                orb_score = watermark_engine.calculate_orb_similarity(temp_path, orig_path)
+                # If orig_path is a video, extract its keyframe for ORB matching
+                if watermark_engine.is_video_file(orig_path):
+                    orig_kf = orig_path + "_keyframe.jpg"
+                    if not os.path.exists(orig_kf):
+                        watermark_engine.extract_keyframe(orig_path, orig_kf)
+                    target_orig_path = orig_kf if os.path.exists(orig_kf) else orig_path
+                else:
+                    target_orig_path = orig_path
+
+                orb_score = watermark_engine.calculate_orb_similarity(orb_test_path, target_orig_path)
                 if orb_score > 25.0 and orb_score > confidence:
                     matched_image = img
                     confidence = orb_score
@@ -172,7 +199,15 @@ async def verify_watermark(file: UploadFile = File(...), db: Session = Depends(a
             # Also compare against watermarked version
             wm_path = os.path.join(WATERMARKED_DIR, img.watermarked_path)
             if os.path.exists(wm_path):
-                orb_score_wm = watermark_engine.calculate_orb_similarity(temp_path, wm_path)
+                if watermark_engine.is_video_file(wm_path):
+                    wm_kf = wm_path + "_keyframe.jpg"
+                    if not os.path.exists(wm_kf):
+                        watermark_engine.extract_keyframe(wm_path, wm_kf)
+                    target_wm_path = wm_kf if os.path.exists(wm_kf) else wm_path
+                else:
+                    target_wm_path = wm_path
+
+                orb_score_wm = watermark_engine.calculate_orb_similarity(orb_test_path, target_wm_path)
                 if orb_score_wm > 25.0 and orb_score_wm > confidence:
                     matched_image = img
                     confidence = orb_score_wm
@@ -181,22 +216,24 @@ async def verify_watermark(file: UploadFile = File(...), db: Session = Depends(a
         pass
     finally:
         try:
-            os.remove(temp_path)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            kf_path = temp_path + "_keyframe.jpg"
+            if os.path.exists(kf_path):
+                os.remove(kf_path)
         except Exception:
             pass
 
     if matched_image and confidence > 50.0:
-        # Lookup from DB directly — blockchain optional
         owner_user = db.query(models.User).filter(models.User.id == matched_image.owner_id).first()
         
-        # Also try blockchain if available
         blockchain_verified = False
         if CopyrightRegistry:
             try:
                 owner_id_bc, wm_id_bc, ts_bc, is_reg = CopyrightRegistry.functions.verifyImage(matched_image.image_hash).call()
                 blockchain_verified = is_reg
             except Exception:
-                blockchain_verified = True  # Trust DB if blockchain unavailable
+                blockchain_verified = True
 
         return {
             "is_registered": True,
@@ -209,7 +246,6 @@ async def verify_watermark(file: UploadFile = File(...), db: Session = Depends(a
             "confidence": round(confidence, 2),
             "blockchain_verified": blockchain_verified
         }
-
 
     return {"is_registered": False}
 
@@ -245,11 +281,12 @@ def download_image(image_id: int, token: str, db: Session = Depends(auth.get_db)
         raise HTTPException(status_code=401, detail="Invalid token")
     img = db.query(models.ImageRecord).filter(models.ImageRecord.id == image_id, models.ImageRecord.owner_id == current_user.id).first()
     if not img or not img.watermarked_path:
-        raise HTTPException(status_code=404, detail="Image not found")
+        raise HTTPException(status_code=404, detail="File not found")
     file_path = os.path.join(WATERMARKED_DIR, img.watermarked_path)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found on disk")
-    return FileResponse(file_path, media_type="image/jpeg", filename=img.watermarked_path)
+    media_type = "video/mp4" if watermark_engine.is_video_file(file_path) else "image/jpeg"
+    return FileResponse(file_path, media_type=media_type, filename=img.watermarked_path)
 
 @app.get("/api/blockchain/blocks")
 def get_blockchain_blocks():

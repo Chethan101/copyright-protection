@@ -198,5 +198,7 @@ def get_violations(current_user: models.User = Depends(auth.get_current_user), d
 def serve_image(image_name: str):
     file_path = os.path.join(UPLOAD_DIR, image_name)
     if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(file_path, media_type="image/jpeg")
+        raise HTTPException(status_code=404, detail="File not found")
+    ext = os.path.splitext(image_name)[1].lower()
+    media_type = "video/mp4" if ext in ['.mp4', '.mov', '.webm', '.avi', '.mkv'] else "image/jpeg"
+    return FileResponse(file_path, media_type=media_type)

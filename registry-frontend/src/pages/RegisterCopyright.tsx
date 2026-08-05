@@ -91,10 +91,14 @@ export default function RegisterCopyright() {
             onDrop={handleDrop}
             onClick={() => fileInputRef.current?.click()}
           >
-            <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*" />
+            <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*,video/*" />
             {preview ? (
               <div className="space-y-4">
-                <img src={preview} alt="Preview" className="max-h-64 mx-auto rounded-lg object-contain shadow-lg" />
+                {file?.type.startsWith('video/') ? (
+                  <video src={preview} controls className="max-h-64 mx-auto rounded-lg shadow-lg" />
+                ) : (
+                  <img src={preview} alt="Preview" className="max-h-64 mx-auto rounded-lg object-contain shadow-lg" />
+                )}
                 <p className="text-sm text-gray-400">Click or drag to change file</p>
               </div>
             ) : (
@@ -103,8 +107,8 @@ export default function RegisterCopyright() {
                   <Upload className="w-8 h-8" />
                 </div>
                 <div>
-                  <p className="font-medium">Upload Image</p>
-                  <p className="text-sm text-gray-500 mt-1">PNG, JPG, JPEG up to 10MB</p>
+                  <p className="font-medium">Upload Image or Video</p>
+                  <p className="text-sm text-gray-500 mt-1">PNG, JPG, MP4, MOV, WEBM up to 50MB</p>
                 </div>
               </div>
             )}
