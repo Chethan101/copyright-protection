@@ -1,27 +1,52 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import api from '../api';
+import { API_BASE_URL } from '../config';
 import { Shield, Activity, Image as ImageIcon, Download } from 'lucide-react';
 
 export default function Dashboard() {
   const [data, setData] = useState<any>(null);
-  
+  const [imageTokens, setImageTokens] = useState<Record<number, string>>({});
+
   useEffect(() => {
     const fetchDashboard = async () => {
       try {
-        const token = localStorage.getItem('registry_token');
-        const res = await axios.get('http://127.0.0.1:8000/api/dashboard', {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        const res = await api.get('/dashboard');
         setData(res.data);
-      } catch (err) {
-        if (err.response?.status === 401) {
-          localStorage.removeItem('registry_token');
-          window.location.href = '/login';
-        }
+      } catch {
+        // 401s are already handled globally by the api client's response interceptor.
       }
     };
     fetchDashboard();
   }, []);
+
+  useEffect(() => {
+    if (!data || data.images.length === 0) return;
+    let cancelled = false;
+    const fetchTokens = async () => {
+      const entries = await Promise.all(
+        data.images.map(async (img: any) => {
+          try {
+            const res = await api.post(`/images/${img.id}/download-token`);
+            return [img.id, res.data.token] as const;
+          } catch {
+            return [img.id, null] as const;
+          }
+        })
+      );
+      if (!cancelled) setImageTokens(Object.fromEntries(entries));
+    };
+    fetchTokens();
+    return () => { cancelled = true; };
+  }, [data]);
+
+  const handleDownload = async (imageId: number) => {
+    try {
+      const res = await api.post(`/images/${imageId}/download-token`);
+      window.open(`${API_BASE_URL}/api/images/${imageId}/download?token=${res.data.token}`, '_blank');
+    } catch {
+      // token mint failed (e.g. session expired) -- interceptor already redirects on 401
+    }
+  };
 
   if (!data) return <div className="text-center py-20">Loading dashboard...</div>;
 
@@ -46,7 +71,7 @@ export default function Dashboard() {
           </div>
           <p className="text-4xl font-bold">{data.stats.my_images}</p>
         </div>
-        
+
         <div className="glass p-6 rounded-2xl relative overflow-hidden group">
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-indigo-500/10 rounded-full blur-2xl group-hover:bg-indigo-500/20 transition-all"></div>
           <div className="flex items-center gap-4 mb-4">
@@ -57,7 +82,7 @@ export default function Dashboard() {
           </div>
           <p className="text-4xl font-bold">{data.stats.total_network_images}</p>
         </div>
-        
+
         <div className="glass p-6 rounded-2xl relative overflow-hidden group">
           <div className="absolute -right-4 -top-4 w-24 h-24 bg-purple-500/10 rounded-full blur-2xl group-hover:bg-purple-500/20 transition-all"></div>
           <div className="flex items-center gap-4 mb-4">
@@ -95,7 +120,16 @@ export default function Dashboard() {
                 {data.images.map((img: any) => (
                   <tr key={img.id} className="hover:bg-gray-800/30 transition-colors">
                     <td className="py-4">
-                      <img src={`http://127.0.0.1:8000/api/images/${img.id}/download?token=${localStorage.getItem('registry_token')}`} alt="preview" className="w-16 h-16 object-cover rounded-lg border border-gray-700" onError={(e) => { e.currentTarget.src = 'https://via.placeholder.com/64?text=Protected' }} />
+                      {imageTokens[img.id] ? (
+                        <img
+                          src={`${API_BASE_URL}/api/images/${img.id}/download?token=${imageTokens[img.id]}`}
+                          alt="preview"
+                          className="w-16 h-16 object-cover rounded-lg border border-gray-700"
+                          onError={(e) => { e.currentTarget.src = 'https://via.placeholder.com/64?text=Protected' }}
+                        />
+                      ) : (
+                        <div className="w-16 h-16 rounded-lg border border-gray-700 bg-gray-800/50 animate-pulse" />
+                      )}
                     </td>
                     <td className="py-4">
                       <span className="font-mono text-sm bg-gray-800 px-2 py-1 rounded text-teal-400">{img.watermark_id}</span>
@@ -109,18 +143,12 @@ export default function Dashboard() {
                       {new Date(img.timestamp).toLocaleDateString()}
                     </td>
                     <td className="py-4">
-                      <a 
-                        href={`http://127.0.0.1:8000/api/images/${img.id}/download`} 
-                        download
+                      <button
+                        onClick={() => handleDownload(img.id)}
                         className="p-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-gray-300 transition-colors inline-block"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          const token = localStorage.getItem('registry_token');
-                          window.open(`http://127.0.0.1:8000/api/images/${img.id}/download?token=${token}`, '_blank');
-                        }}
                       >
                         <Download className="w-4 h-4" />
-                      </a>
+                      </button>
                     </td>
                   </tr>
                 ))}

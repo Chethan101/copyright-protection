@@ -1,31 +1,61 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from .database import engine, SessionLocal, Base
-from . import models, auth
-import os, uuid, shutil, requests
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
+from .database import engine, Base
+from . import models, auth, upload_utils, config
+import os, uuid, requests
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 Base.metadata.create_all(bind=engine)
 
+if engine.dialect.name == "sqlite":
+    # No migration framework in this project; additive SQLite columns are cheap
+    # and safe to backfill here so pre-existing DBs pick up new model fields.
+    with engine.connect() as conn:
+        existing_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(violation_logs)"))}
+        if existing_cols and "match_method" not in existing_cols:
+            conn.execute(text("ALTER TABLE violation_logs ADD COLUMN match_method VARCHAR"))
+            conn.commit()
+
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), 'uploads')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-REGISTRY_URL = "http://127.0.0.1:8000/api"
+REGISTRY_URL = config.REGISTRY_URL
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/register")
 def register(username: str = Form(...), password: str = Form(...), db: Session = Depends(auth.get_db)):
+    auth.validate_credentials(username, password)
+    username = username.strip()
     if db.query(models.User).filter(models.User.username == username).first():
         raise HTTPException(status_code=400, detail="Username already registered")
     user = models.User(username=username, password_hash=auth.get_password_hash(password))
-    db.add(user); db.commit()
+    db.add(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Username already registered")
     return {"msg": "Registered successfully"}
 
 @app.post("/api/login")
@@ -51,7 +81,7 @@ def _post_dict(p: models.Post, db: Session, current_user_id: int = None):
         "id": p.id,
         "uploader": uploader.username if uploader else "Unknown",
         "uploader_id": p.uploader_id,
-        "image_url": f"http://localhost:8001/api/images/{p.image_path}",
+        "image_url": f"/api/images/{p.image_path}",
         "caption": p.caption or "",
         "timestamp": p.timestamp.isoformat(),
         "likes_count": len(p.likes),
@@ -62,19 +92,26 @@ def _post_dict(p: models.Post, db: Session, current_user_id: int = None):
     }
 
 @app.post("/api/posts/upload")
+@limiter.limit(config.RATE_LIMIT_UPLOAD)
 async def upload_post(
+    request: Request,
     file: UploadFile = File(...),
     caption: str = Form(default=""),
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(auth.get_db)
 ):
-    temp_path = os.path.join(UPLOAD_DIR, f"check_{uuid.uuid4().hex[:8]}_{file.filename}")
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    ext = upload_utils.validate_extension(file.filename)
+    temp_path = os.path.join(UPLOAD_DIR, upload_utils.generate_filename("check", current_user.id, ext))
+    await upload_utils.save_upload_streaming(file, temp_path, config.MAX_UPLOAD_SIZE_BYTES)
 
     try:
         with open(temp_path, "rb") as f:
-            resp = requests.post(f"{REGISTRY_URL}/verify-watermark", files={"file": (file.filename, f, file.content_type)}, timeout=15)
+            resp = requests.post(
+                f"{REGISTRY_URL}/verify-watermark",
+                files={"file": (file.filename, f, file.content_type)},
+                headers={"x-registry-internal": config.INTERNAL_API_KEY},
+                timeout=config.REGISTRY_TIMEOUT_SECONDS
+            )
             resp.raise_for_status()
             verification_result = resp.json()
     except Exception as e:
@@ -89,6 +126,7 @@ async def upload_post(
             image_id=str(verification_result.get("image_id")),
             tx_hash=verification_result.get("tx_hash"),
             confidence_score=verification_result.get("confidence"),
+            match_method=verification_result.get("match_method"),
             reason="Unauthorized Upload Attempt"
         )
         db.add(log); db.commit()
@@ -97,12 +135,16 @@ async def upload_post(
             "message": "Copyright Protected Content",
             "owner_name": verification_result.get("owner_name"),
             "owner_id": verification_result.get("owner_id"),
+            "owner_source": verification_result.get("owner_source"),
+            "watermark_id": verification_result.get("watermark_id"),
             "tx_id": verification_result.get("tx_hash"),
             "timestamp": verification_result.get("timestamp"),
-            "confidence": verification_result.get("confidence")
+            "confidence": verification_result.get("confidence"),
+            "match_method": verification_result.get("match_method"),
+            "blockchain_verified": verification_result.get("blockchain_verified")
         })
 
-    post_filename = f"post_{current_user.id}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    post_filename = upload_utils.generate_filename("post", current_user.id, ext)
     os.rename(temp_path, os.path.join(UPLOAD_DIR, post_filename))
     new_post = models.Post(uploader_id=current_user.id, image_path=post_filename, caption=caption)
     db.add(new_post); db.commit(); db.refresh(new_post)
@@ -138,7 +180,11 @@ def toggle_like(post_id: int, current_user: models.User = Depends(auth.get_curre
         return {"liked": False, "likes_count": db.query(models.Like).filter(models.Like.post_id == post_id).count()}
     else:
         like = models.Like(user_id=current_user.id, post_id=post_id)
-        db.add(like); db.commit()
+        db.add(like)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()  # Already liked concurrently — idempotent, treat as success
         return {"liked": True, "likes_count": db.query(models.Like).filter(models.Like.post_id == post_id).count()}
 
 # ── Comments ──────────────────────────────────────────────────────────────────
@@ -187,18 +233,20 @@ def repost(post_id: int, current_user: models.User = Depends(auth.get_current_us
 @app.get("/api/violations")
 def get_violations(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
     violations = db.query(models.ViolationLog).filter(models.ViolationLog.attempted_by_id == current_user.id).order_by(models.ViolationLog.timestamp.desc()).all()
-    alerts = db.query(models.ViolationLog).filter(models.ViolationLog.original_owner_id == current_user.id).order_by(models.ViolationLog.timestamp.desc()).all()
+    # original_owner_id is registry-backend's user id, from registry's own independent
+    # users table -- it has no relationship to this service's ids and must never be
+    # compared against current_user.id here. original_owner_name (a plain username
+    # string) is the only field both services agree on; match on that instead.
+    alerts = db.query(models.ViolationLog).filter(models.ViolationLog.original_owner_name == current_user.username).order_by(models.ViolationLog.timestamp.desc()).all()
     def v_dict(v):
-        return {"id": v.id, "attempted_by_id": v.attempted_by_id, "original_owner_name": v.original_owner_name, "tx_hash": v.tx_hash, "confidence_score": v.confidence_score, "reason": v.reason, "timestamp": v.timestamp.isoformat()}
+        return {"id": v.id, "attempted_by_id": v.attempted_by_id, "original_owner_name": v.original_owner_name, "tx_hash": v.tx_hash, "confidence_score": v.confidence_score, "match_method": v.match_method, "reason": v.reason, "timestamp": v.timestamp.isoformat()}
     return {"my_violations": [v_dict(v) for v in violations], "notifications": [v_dict(v) for v in alerts]}
 
 # ── Static images ─────────────────────────────────────────────────────────────
 
 @app.get("/api/images/{image_name}")
 def serve_image(image_name: str):
-    file_path = os.path.join(UPLOAD_DIR, image_name)
+    file_path = upload_utils.safe_join(UPLOAD_DIR, image_name)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
-    ext = os.path.splitext(image_name)[1].lower()
-    media_type = "video/mp4" if ext in ['.mp4', '.mov', '.webm', '.avi', '.mkv'] else "image/jpeg"
-    return FileResponse(file_path, media_type=media_type)
+    return FileResponse(file_path, media_type=upload_utils.media_type_for(file_path))

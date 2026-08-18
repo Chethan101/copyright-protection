@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import axios from 'axios';
+import api from '../api';
 
 export default function Register() {
   const [username, setUsername] = useState('');
@@ -14,7 +14,7 @@ export default function Register() {
       form.append('username', username);
       form.append('password', password);
       
-      await axios.post('http://127.0.0.1:8000/api/register', form);
+      await api.post('/register', form);
       setSuccess('Account created! You can now login.');
       setError('');
       setUsername('');

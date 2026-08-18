@@ -1,8 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
-import axios from 'axios';
-
-const API = 'http://127.0.0.1:8001/api';
+import api from '../api';
+import { API_BASE_URL } from '../config';
 
 export default function Profile() {
   const { username } = useParams<{ username: string }>();
@@ -12,7 +11,7 @@ export default function Profile() {
   useEffect(() => {
     const fetch = async () => {
       try {
-        const res = await axios.get(`${API}/profile/${username}`, { headers: { Authorization: `Bearer ${localStorage.getItem('social_token')}` } });
+        const res = await api.get(`/profile/${username}`);
         setData(res.data);
       } catch { }
     };
@@ -65,9 +64,9 @@ export default function Profile() {
           {data.posts.map((p: any) => (
             <div key={p.id} style={{ position: 'relative', aspectRatio: '1', overflow: 'hidden', background: 'var(--surface2)' }}>
               {['.mp4', '.mov', '.webm', '.avi', '.mkv'].some(ext => p.image_url.toLowerCase().endsWith(ext)) ? (
-                <video src={p.image_url} className="profile-grid-img" muted />
+                <video src={`${API_BASE_URL}${p.image_url}`} className="profile-grid-img" muted />
               ) : (
-                <img src={p.image_url} alt="" className="profile-grid-img" />
+                <img src={`${API_BASE_URL}${p.image_url}`} alt="" className="profile-grid-img" />
               )}
               <div style={{
                 position: 'absolute', inset: 0, background: 'rgba(0,0,0,0)',

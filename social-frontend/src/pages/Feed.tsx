@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
+import api from '../api';
+import { API_BASE_URL } from '../config';
 
-const API = 'http://127.0.0.1:8001/api';
-const token = () => localStorage.getItem('social_token');
 const myUsername = () => localStorage.getItem('social_username') || '';
 
 function timeAgo(iso: string) {
@@ -65,9 +64,9 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
 
       {/* Media: Image or Video */}
       {['.mp4', '.mov', '.webm', '.avi', '.mkv'].some(ext => post.image_url.toLowerCase().endsWith(ext)) ? (
-        <video src={post.image_url} controls loop muted className="post-image" />
+        <video src={`${API_BASE_URL}${post.image_url}`} controls loop muted className="post-image" />
       ) : (
-        <img src={post.image_url} alt="post" className="post-image" />
+        <img src={`${API_BASE_URL}${post.image_url}`} alt="post" className="post-image" />
       )}
 
       {/* Action buttons */}
@@ -177,10 +176,10 @@ export default function Feed({ onOpenUpload }: { onOpenUpload: () => void }) {
 
   const fetchFeed = async () => {
     try {
-      const res = await axios.get(`${API}/feed`, { headers: { Authorization: `Bearer ${token()}` } });
+      const res = await api.get('/feed');
       setPosts(res.data.posts);
-    } catch (err: any) {
-      if (err.response?.status === 401) window.location.href = '/login';
+    } catch {
+      // 401s are already handled globally by the api client's response interceptor.
     } finally {
       setLoading(false);
     }
@@ -189,19 +188,19 @@ export default function Feed({ onOpenUpload }: { onOpenUpload: () => void }) {
   useEffect(() => { fetchFeed(); }, []);
 
   const handleLike = async (postId: number) => {
-    await axios.post(`${API}/posts/${postId}/like`, {}, { headers: { Authorization: `Bearer ${token()}` } });
+    await api.post(`/posts/${postId}/like`, {});
   };
 
   const handleComment = async (postId: number, text: string) => {
     try {
-      const res = await axios.post(`${API}/posts/${postId}/comment`, { text }, { headers: { Authorization: `Bearer ${token()}` } });
+      const res = await api.post(`/posts/${postId}/comment`, { text });
       return res.data;
     } catch { return null; }
   };
 
   const handleRepost = async (postId: number) => {
     try {
-      await axios.post(`${API}/posts/${postId}/repost`, {}, { headers: { Authorization: `Bearer ${token()}` } });
+      await api.post(`/posts/${postId}/repost`, {});
       fetchFeed();
     } catch (err: any) {
       if (err.response?.data?.detail === 'Already reposted') alert('You already reposted this!');

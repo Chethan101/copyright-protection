@@ -1,7 +1,23 @@
 import { useState, useRef } from 'react';
-import axios from 'axios';
+import api from '../api';
 
-const API = 'http://127.0.0.1:8001/api';
+const MATCH_METHOD_LABELS: Record<string, { icon: string; label: string; detail: string }> = {
+  watermark: {
+    icon: '🔒',
+    label: 'Invisible Watermark Detected',
+    detail: 'A hidden watermark embedded at registration time was extracted from this exact file.',
+  },
+  perceptual_hash: {
+    icon: '🔍',
+    label: 'Perceptual Hash Match',
+    detail: 'This file is a near-identical copy (resave, minor resize/crop) of registered content.',
+  },
+  orb_visual_similarity: {
+    icon: '📸',
+    label: 'Visual Similarity Match',
+    detail: 'This looks like a screenshot or camera re-capture of registered content — the underlying visual structure still matches even though the watermark and file itself changed.',
+  },
+};
 
 export default function Upload({ onClose }: { onClose: () => void }) {
   const [step, setStep] = useState<'select' | 'caption' | 'loading' | 'blocked' | 'success'>('select');
@@ -29,8 +45,7 @@ export default function Upload({ onClose }: { onClose: () => void }) {
     formData.append('file', file);
     formData.append('caption', caption);
     try {
-      const token = localStorage.getItem('social_token');
-      await axios.post(`${API}/posts/upload`, formData, { headers: { Authorization: `Bearer ${token}` } });
+      await api.post('/posts/upload', formData);
       setStep('success');
       setTimeout(() => { onClose(); window.location.reload(); }, 1800);
     } catch (err: any) {
@@ -149,10 +164,33 @@ export default function Upload({ onClose }: { onClose: () => void }) {
                 <span style={{ color: 'var(--text-muted)' }}>Original Owner</span>
                 <span style={{ fontWeight: 700 }}>@{blockInfo.owner_name}</span>
               </div>
+              {blockInfo.owner_source === 'blockchain' && (
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 12 }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Ownership source</span>
+                  <span style={{ fontWeight: 700, color: '#22c55e' }}>⛓️ verified on-chain</span>
+                </div>
+              )}
+              {blockInfo.watermark_id && (
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 12 }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Watermark ID</span>
+                  <span style={{ fontWeight: 700, fontFamily: 'monospace' }}>{blockInfo.watermark_id}</span>
+                </div>
+              )}
               <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8, fontSize: 14 }}>
                 <span style={{ color: 'var(--text-muted)' }}>Confidence</span>
                 <span style={{ fontWeight: 700, color: '#ef4444' }}>{blockInfo.confidence?.toFixed(1)}%</span>
               </div>
+              {blockInfo.match_method && MATCH_METHOD_LABELS[blockInfo.match_method] && (
+                <div style={{ borderTop: '1px solid var(--border)', marginTop: 4, paddingTop: 10 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, fontSize: 13, marginBottom: 4 }}>
+                    <span>{MATCH_METHOD_LABELS[blockInfo.match_method].icon}</span>
+                    <span>{MATCH_METHOD_LABELS[blockInfo.match_method].label}</span>
+                  </div>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                    {MATCH_METHOD_LABELS[blockInfo.match_method].detail}
+                  </p>
+                </div>
+              )}
               <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 8, wordBreak: 'break-all' }}>
                 <span style={{ color: 'var(--text-muted)' }}>Tx: </span>
                 <span style={{ fontFamily: 'monospace', color: '#818cf8' }}>{blockInfo.tx_id?.substring(0, 32)}...</span>

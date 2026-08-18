@@ -129,8 +129,9 @@ body {
 
 .post-image {
   width: 100%;
-  max-height: 600px;
-  object-fit: cover;
+  max-height: 750px;
+  object-fit: contain;
+  background: #000;
   display: block;
 }
 

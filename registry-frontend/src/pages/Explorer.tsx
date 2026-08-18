@@ -1,17 +1,20 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import api from '../api';
 import { Box, Hash, Clock, ArrowRight } from 'lucide-react';
 
 export default function Explorer() {
   const [blocks, setBlocks] = useState<any[]>([]);
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     const fetchBlocks = async () => {
       try {
-        const res = await axios.get('http://127.0.0.1:8000/api/blockchain/blocks');
+        const res = await api.get('/blockchain/blocks');
         setBlocks(res.data.blocks);
-      } catch (err) {
+      } catch {
         console.error("Failed to fetch blocks");
+      } finally {
+        setLoaded(true);
       }
     };
     fetchBlocks();
@@ -27,8 +30,12 @@ export default function Explorer() {
       </div>
 
       <div className="space-y-6">
-        {blocks.length === 0 ? (
+        {!loaded ? (
           <div className="text-center py-20 text-gray-500">Loading blockchain data...</div>
+        ) : blocks.length === 0 ? (
+          <div className="text-center py-20 text-gray-500">
+            No blockchain data available. Is the local Ganache node running?
+          </div>
         ) : (
           blocks.map((block) => (
             <div key={block.number} className="glass rounded-xl overflow-hidden shadow-lg border border-gray-800">
@@ -49,7 +56,7 @@ export default function Explorer() {
                   {block.transactions.length} Txn(s)
                 </div>
               </div>
-              
+
               <div className="p-4 space-y-4">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
                   <div>
@@ -61,7 +68,7 @@ export default function Explorer() {
                     <span className="font-mono text-gray-400 break-all">{block.parentHash}</span>
                   </div>
                 </div>
-                
+
                 {block.transactions.length > 0 && (
                   <div className="mt-4 pt-4 border-t border-gray-800/50">
                     <h4 className="text-sm font-semibold mb-3 flex items-center gap-2">

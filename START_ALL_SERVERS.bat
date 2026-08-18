@@ -12,11 +12,11 @@ echo =====================================================
 echo.
 
 echo [1/4] Starting Registry Backend (port 8000)...
-start "Registry Backend :8000" cmd /k "cd /d ""%~dp0registry-backend"" && venv\Scripts\python -m uvicorn app.main:app --reload --port 8000"
+start "Registry Backend :8000" cmd /k "cd /d ""%~dp0registry-backend"" && ..\venv\Scripts\python -m uvicorn app.main:app --reload --port 8000"
 timeout /t 2 /nobreak >nul
 
 echo [2/4] Starting Social Backend (port 8001)...
-start "Social Backend :8001" cmd /k "cd /d ""%~dp0social-backend"" && venv\Scripts\python -m uvicorn app.main:app --reload --port 8001"
+start "Social Backend :8001" cmd /k "cd /d ""%~dp0social-backend"" && ..\venv\Scripts\python -m uvicorn app.main:app --reload --port 8001"
 timeout /t 2 /nobreak >nul
 
 echo [3/4] Starting Registry Frontend (port 3000)...
