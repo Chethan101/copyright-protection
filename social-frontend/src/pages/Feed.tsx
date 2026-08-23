@@ -12,7 +12,62 @@ function timeAgo(iso: string) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function PostCard({ post, onLike, onComment, onRepost }: any) {
+function PostMenu({ post, onDelete }: any) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [open]);
+
+  const handleDelete = () => {
+    setOpen(false);
+    if (window.confirm('Delete this post? This can\'t be undone.')) {
+      onDelete(post.id);
+    }
+  };
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button
+        style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text)', fontSize: 20, padding: '0 4px' }}
+        onClick={() => setOpen(o => !o)}
+      >
+        •••
+      </button>
+      {open && (
+        <div style={{
+          position: 'absolute', right: 0, top: '100%', zIndex: 10,
+          background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 10,
+          minWidth: 160, boxShadow: '0 8px 24px rgba(0,0,0,0.3)', overflow: 'hidden',
+        }}>
+          {post.is_owner ? (
+            <button
+              onClick={handleDelete}
+              style={{ display: 'block', width: '100%', textAlign: 'left', padding: '12px 16px', background: 'none', border: 'none', color: '#ef4444', fontWeight: 700, fontSize: 14, cursor: 'pointer' }}
+            >
+              Delete
+            </button>
+          ) : (
+            <button
+              onClick={() => setOpen(false)}
+              style={{ display: 'block', width: '100%', textAlign: 'left', padding: '12px 16px', background: 'none', border: 'none', color: 'var(--text)', fontSize: 14, cursor: 'pointer' }}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PostCard({ post, onLike, onComment, onRepost, onSave, onDelete }: any) {
   const [showAllComments, setShowAllComments] = useState(false);
   const [commentText, setCommentText] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -20,6 +75,7 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
   const [localLiked, setLocalLiked] = useState(post.liked);
   const [localLikes, setLocalLikes] = useState(post.likes_count);
   const [localComments, setLocalComments] = useState(post.comments);
+  const [localSaved, setLocalSaved] = useState(post.saved);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleLike = async () => {
@@ -28,6 +84,11 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
     setLocalLiked(!localLiked);
     setLocalLikes((n: number) => localLiked ? n - 1 : n + 1);
     await onLike(post.id);
+  };
+
+  const handleSave = async () => {
+    setLocalSaved(!localSaved);
+    await onSave(post.id);
   };
 
   const handleComment = async (e: React.FormEvent) => {
@@ -59,7 +120,7 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
             {post.repost_of && <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Reposted</div>}
           </div>
         </a>
-        <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text)', fontSize: 20, padding: '0 4px' }}>•••</button>
+        <PostMenu post={post} onDelete={onDelete} />
       </div>
 
       {/* Media: Image or Video */}
@@ -92,8 +153,8 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
           </svg>
         </button>
 
-        <button className="action-btn save-btn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <button className="action-btn save-btn" onClick={handleSave} title={localSaved ? 'Remove from saved' : 'Save'}>
+          <svg viewBox="0 0 24 24" fill={localSaved ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2">
             <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
           </svg>
         </button>
@@ -207,6 +268,19 @@ export default function Feed({ onOpenUpload }: { onOpenUpload: () => void }) {
     }
   };
 
+  const handleSave = async (postId: number) => {
+    await api.post(`/posts/${postId}/save`, {});
+  };
+
+  const handleDelete = async (postId: number) => {
+    try {
+      await api.delete(`/posts/${postId}`);
+      setPosts(prev => prev.filter(p => p.id !== postId));
+    } catch {
+      alert('Failed to delete post');
+    }
+  };
+
   if (loading) return (
     <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '80vh' }}>
       <div className="spinner" style={{ width: 36, height: 36, borderWidth: 3 }} />
@@ -236,6 +310,8 @@ export default function Feed({ onOpenUpload }: { onOpenUpload: () => void }) {
           onLike={handleLike}
           onComment={handleComment}
           onRepost={handleRepost}
+          onSave={handleSave}
+          onDelete={handleDelete}
         />
       ))}
     </div>

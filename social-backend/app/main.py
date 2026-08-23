@@ -71,12 +71,14 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 def _post_dict(p: models.Post, db: Session, current_user_id: int = None):
     uploader = db.query(models.User).filter(models.User.id == p.uploader_id).first()
     liked = False
+    saved = False
     if current_user_id:
         liked = db.query(models.Like).filter(models.Like.post_id == p.id, models.Like.user_id == current_user_id).first() is not None
+        saved = db.query(models.SavedPost).filter(models.SavedPost.post_id == p.id, models.SavedPost.user_id == current_user_id).first() is not None
     comments = []
     for c in sorted(p.comments, key=lambda x: x.timestamp):
         commenter = db.query(models.User).filter(models.User.id == c.user_id).first()
-        comments.append({"id": c.id, "username": commenter.username if commenter else "?", "text": c.text, "timestamp": c.timestamp.isoformat()})
+        comments.append({"id": c.id, "user_id": c.user_id, "username": commenter.username if commenter else "?", "text": c.text, "timestamp": c.timestamp.isoformat()})
     return {
         "id": p.id,
         "uploader": uploader.username if uploader else "Unknown",
@@ -86,9 +88,11 @@ def _post_dict(p: models.Post, db: Session, current_user_id: int = None):
         "timestamp": p.timestamp.isoformat(),
         "likes_count": len(p.likes),
         "liked": liked,
+        "saved": saved,
         "comments": comments,
         "comments_count": len(p.comments),
         "repost_of": p.repost_of,
+        "is_owner": current_user_id == p.uploader_id,
     }
 
 @app.post("/api/posts/upload")
@@ -155,6 +159,33 @@ def get_feed(current_user: models.User = Depends(auth.get_current_user), db: Ses
     posts = db.query(models.Post).order_by(models.Post.timestamp.desc()).all()
     return {"posts": [_post_dict(p, db, current_user.id) for p in posts]}
 
+@app.delete("/api/posts/{post_id}")
+def delete_post(post_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.uploader_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own posts")
+
+    image_path = post.image_path
+    # Reposts of this post copy its file reference rather than owning a separate upload
+    # (see /posts/{id}/repost). Detach them into standalone posts instead of leaving a
+    # dangling repost_of, matching how reposts behave on real platforms when the
+    # original is removed -- the repost itself is not deleted.
+    db.query(models.Post).filter(models.Post.repost_of == post_id).update({"repost_of": None})
+    db.delete(post)  # cascades likes/comments/saves via the model relationships
+    db.commit()
+
+    # Only remove the file if no other post (a repost, or this same file reposted
+    # again) still references it.
+    still_referenced = db.query(models.Post).filter(models.Post.image_path == image_path).first()
+    if not still_referenced:
+        file_path = upload_utils.safe_join(UPLOAD_DIR, image_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    return {"msg": "Post deleted"}
+
 @app.get("/api/profile/{username}")
 def get_profile(username: str, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
     user = db.query(models.User).filter(models.User.username == username).first()
@@ -186,6 +217,32 @@ def toggle_like(post_id: int, current_user: models.User = Depends(auth.get_curre
         except IntegrityError:
             db.rollback()  # Already liked concurrently — idempotent, treat as success
         return {"liked": True, "likes_count": db.query(models.Like).filter(models.Like.post_id == post_id).count()}
+
+# ── Saves / Bookmarks ─────────────────────────────────────────────────────────
+
+@app.post("/api/posts/{post_id}/save")
+def toggle_save(post_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    existing = db.query(models.SavedPost).filter(models.SavedPost.post_id == post_id, models.SavedPost.user_id == current_user.id).first()
+    if existing:
+        db.delete(existing); db.commit()
+        return {"saved": False}
+    else:
+        save = models.SavedPost(user_id=current_user.id, post_id=post_id)
+        db.add(save)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()  # Already saved concurrently -- idempotent, treat as success
+        return {"saved": True}
+
+@app.get("/api/saved")
+def get_saved(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
+    saves = db.query(models.SavedPost).filter(models.SavedPost.user_id == current_user.id).order_by(models.SavedPost.timestamp.desc()).all()
+    posts = [s.post for s in saves if s.post is not None]
+    return {"posts": [_post_dict(p, db, current_user.id) for p in posts]}
 
 # ── Comments ──────────────────────────────────────────────────────────────────
 

@@ -6,6 +6,7 @@ import Feed from './pages/Feed';
 import Upload from './pages/Upload';
 import Notifications from './pages/Notifications';
 import Profile from './pages/Profile';
+import Saved from './pages/Saved';
 import './index.css';
 
 function Sidebar({ onUpload }: { onUpload: () => void }) {
@@ -44,6 +45,11 @@ function Sidebar({ onUpload }: { onUpload: () => void }) {
         <button className={active('/notifications')} onClick={() => navigate('/notifications')}>
           <svg viewBox="0 0 24 24" fill={location.pathname === '/notifications' ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
           Notifications
+        </button>
+
+        <button className={active('/saved')} onClick={() => navigate('/saved')}>
+          <svg viewBox="0 0 24 24" fill={location.pathname === '/saved' ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+          Saved
         </button>
 
         <button className={active(`/profile/${username}`)} onClick={() => navigate(`/profile/${username}`)}>
@@ -99,6 +105,7 @@ function AppShell() {
           <Route path="/register" element={<Register />} />
           <Route path="/feed" element={token ? <Feed onOpenUpload={() => setShowUpload(true)} /> : <Navigate to="/login" />} />
           <Route path="/notifications" element={token ? <Notifications /> : <Navigate to="/login" />} />
+          <Route path="/saved" element={token ? <Saved /> : <Navigate to="/login" />} />
           <Route path="/profile/:username" element={token ? <Profile /> : <Navigate to="/login" />} />
         </Routes>
       </div>

@@ -9,9 +9,11 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from .database import engine, Base
 from . import models, auth, watermark_engine, upload_utils, config
-import json, os, uuid
+import json, logging, os, uuid
 from datetime import datetime
 from web3 import Web3
+
+logger = logging.getLogger("registry.blockchain")
 
 Base.metadata.create_all(bind=engine)
 
@@ -29,10 +31,35 @@ app.add_middleware(
 )
 
 w3 = Web3(Web3.HTTPProvider(config.GANACHE_RPC_URL))
-try:
-    w3.eth.default_account = w3.eth.accounts[0]
-except Exception:
-    pass
+
+
+def _ensure_default_account():
+    """
+    Resolve w3.eth.default_account on demand rather than once at import time.
+
+    A one-shot attempt at startup is fragile: if Ganache isn't reachable yet at that
+    exact moment (a startup ordering race, or the node still booting), the account stays
+    unset for the rest of the process's life and every subsequent transact() silently
+    fails -- even after Ganache comes up seconds later. Re-checking here means the very
+    next registration after Ganache becomes reachable just works, with no restart needed.
+
+    web3.py represents "unset" as its own `Empty` sentinel, not None or a falsy value --
+    `w3.eth.default_account is not None` is therefore always true and never re-attempts
+    the assignment. An address is a plain str at runtime (ChecksumAddress is only a
+    NewType, not a real class, so isinstance against it is not usable here) -- confirmed
+    via a live Web3RPCError where an unset default_account was passed straight through
+    to a transaction's `from` field as that sentinel object instead of an address.
+    """
+    if isinstance(w3.eth.default_account, str):
+        return True
+    try:
+        w3.eth.default_account = w3.eth.accounts[0]
+        return True
+    except Exception:
+        return False
+
+
+_ensure_default_account()
 contract_info_path = os.path.join(os.path.dirname(__file__), 'contract_info.json')
 CopyrightRegistry = None
 if os.path.exists(contract_info_path):
@@ -147,14 +174,18 @@ async def register_image(request: Request, file: UploadFile = File(...), current
     tx_hash_hex = f"0x{uuid.uuid4().hex}{uuid.uuid4().hex}"
     block_number = 0
     blockchain_registered = False
-    if CopyrightRegistry:
+    if CopyrightRegistry and _ensure_default_account():
         try:
             owner_id, wm_id, ts, is_reg = CopyrightRegistry.functions.verifyImage(image_hash).call()
             if is_reg:
                 os.remove(original_path)
                 os.remove(output_path)
                 raise HTTPException(status_code=400, detail="Image already registered on blockchain")
-            tx_hash = CopyrightRegistry.functions.registerImage(image_hash, str(current_user.id), watermark_id).transact()
+            # Pass `from` explicitly rather than relying on w3.eth.default_account being
+            # picked up implicitly -- confirmed this web3.py/Ganache combination rejects
+            # the transaction ("from not found; is required") without it, even though
+            # default_account is set.
+            tx_hash = CopyrightRegistry.functions.registerImage(image_hash, str(current_user.id), watermark_id).transact({"from": w3.eth.default_account})
             w3.eth.wait_for_transaction_receipt(tx_hash)
             tx_hash_hex = tx_hash.hex()
             receipt = w3.eth.get_transaction_receipt(tx_hash)
@@ -163,7 +194,10 @@ async def register_image(request: Request, file: UploadFile = File(...), current
         except HTTPException:
             raise
         except Exception:
-            pass  # Blockchain unavailable, continue with DB-only registration
+            # Blockchain unavailable -- continue with DB-only registration, but log it
+            # rather than failing silently. A silent swallow here is exactly what let a
+            # real, persistent chain-connectivity fault go unnoticed for a long time.
+            logger.exception("Blockchain registration failed for image_hash=%s; falling back to DB-only", image_hash)
 
     img_record = models.ImageRecord(owner_id=current_user.id, image_hash=image_hash, watermark_id=watermark_id, tx_hash=tx_hash_hex, watermarked_path=output_filename, original_path=original_filename)
     db.add(img_record)

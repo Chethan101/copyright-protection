@@ -107,3 +107,95 @@ def test_repost_success_and_duplicate_rejected(client, register_user, test_image
 
     second = client.post(f"/api/posts/{post_id}/repost", headers={"Authorization": f"Bearer {reposter_token}"})
     assert second.status_code == 400
+
+
+def test_save_toggle(client, auth_headers, test_image_bytes, mock_registry):
+    mock_registry(json_response={"is_registered": False})
+    post_id = _upload(client, auth_headers["headers"], test_image_bytes)
+
+    save_resp = client.post(f"/api/posts/{post_id}/save", headers=auth_headers["headers"])
+    assert save_resp.status_code == 200
+    assert save_resp.json() == {"saved": True}
+
+    saved_list = client.get("/api/saved", headers=auth_headers["headers"]).json()["posts"]
+    assert [p["id"] for p in saved_list] == [post_id]
+    assert saved_list[0]["saved"] is True
+
+    unsave_resp = client.post(f"/api/posts/{post_id}/save", headers=auth_headers["headers"])
+    assert unsave_resp.json() == {"saved": False}
+    assert client.get("/api/saved", headers=auth_headers["headers"]).json()["posts"] == []
+
+
+def test_save_nonexistent_post_404(client, auth_headers):
+    resp = client.post("/api/posts/99999/save", headers=auth_headers["headers"])
+    assert resp.status_code == 404
+
+
+def test_saved_posts_are_private_per_user(client, register_user, test_image_bytes, mock_registry):
+    mock_registry(json_response={"is_registered": False})
+    owner_u, owner_p = register_user()
+    other_u, other_p = register_user()
+    owner_token = client_login(client, owner_u, owner_p)
+    other_token = client_login(client, other_u, other_p)
+
+    post_id = _upload(client, {"Authorization": f"Bearer {owner_token}"}, test_image_bytes)
+    client.post(f"/api/posts/{post_id}/save", headers={"Authorization": f"Bearer {other_token}"})
+
+    assert client.get("/api/saved", headers={"Authorization": f"Bearer {other_token}"}).json()["posts"]
+    assert client.get("/api/saved", headers={"Authorization": f"Bearer {owner_token}"}).json()["posts"] == []
+
+
+def test_delete_post_requires_ownership(client, register_user, test_image_bytes, mock_registry):
+    mock_registry(json_response={"is_registered": False})
+    owner_u, owner_p = register_user()
+    other_u, other_p = register_user()
+    owner_token = client_login(client, owner_u, owner_p)
+    other_token = client_login(client, other_u, other_p)
+
+    post_id = _upload(client, {"Authorization": f"Bearer {owner_token}"}, test_image_bytes)
+
+    forbidden = client.delete(f"/api/posts/{post_id}", headers={"Authorization": f"Bearer {other_token}"})
+    assert forbidden.status_code == 403
+
+    allowed = client.delete(f"/api/posts/{post_id}", headers={"Authorization": f"Bearer {owner_token}"})
+    assert allowed.status_code == 200
+
+    feed = client.get("/api/feed", headers={"Authorization": f"Bearer {owner_token}"}).json()["posts"]
+    assert post_id not in [p["id"] for p in feed]
+
+
+def test_delete_nonexistent_post_404(client, auth_headers):
+    resp = client.delete("/api/posts/99999", headers=auth_headers["headers"])
+    assert resp.status_code == 404
+
+
+def test_deleting_original_detaches_reposts_instead_of_deleting_them(client, register_user, test_image_bytes, mock_registry):
+    mock_registry(json_response={"is_registered": False})
+    owner_u, owner_p = register_user()
+    reposter_u, reposter_p = register_user()
+    owner_token = client_login(client, owner_u, owner_p)
+    reposter_token = client_login(client, reposter_u, reposter_p)
+
+    post_id = _upload(client, {"Authorization": f"Bearer {owner_token}"}, test_image_bytes)
+    client.post(f"/api/posts/{post_id}/repost", headers={"Authorization": f"Bearer {reposter_token}"})
+
+    client.delete(f"/api/posts/{post_id}", headers={"Authorization": f"Bearer {owner_token}"})
+
+    feed = client.get("/api/feed", headers={"Authorization": f"Bearer {reposter_token}"}).json()["posts"]
+    repost = next(p for p in feed if p["uploader"] == reposter_u)
+    assert repost["repost_of"] is None
+
+
+def test_post_dict_reports_ownership(client, register_user, test_image_bytes, mock_registry):
+    mock_registry(json_response={"is_registered": False})
+    owner_u, owner_p = register_user()
+    other_u, other_p = register_user()
+    owner_token = client_login(client, owner_u, owner_p)
+    other_token = client_login(client, other_u, other_p)
+
+    post_id = _upload(client, {"Authorization": f"Bearer {owner_token}"}, test_image_bytes)
+
+    owner_view = client.get("/api/feed", headers={"Authorization": f"Bearer {owner_token}"}).json()["posts"]
+    other_view = client.get("/api/feed", headers={"Authorization": f"Bearer {other_token}"}).json()["posts"]
+    assert next(p for p in owner_view if p["id"] == post_id)["is_owner"] is True
+    assert next(p for p in other_view if p["id"] == post_id)["is_owner"] is False

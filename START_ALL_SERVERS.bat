@@ -41,7 +41,7 @@ start http://localhost:4000
 
 echo.
 echo Servers running:
-echo   Registry Portal  -> http://localhost:3000
+echo   Registry Portal  -> http://localchost:3000
 echo   Social Portal    -> http://localhost:4000
 echo   Registry API     -> http://localhost:8000
 echo   Social API       -> http://localhost:8001
