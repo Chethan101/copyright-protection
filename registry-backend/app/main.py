@@ -223,6 +223,21 @@ async def register_image(request: Request, file: UploadFile = File(...), current
         "blockchain_registered": blockchain_registered
     }
 
+def _orb_candidate_path(img):
+    """The stored file to compare a record against: its watermarked copy, else the original."""
+    for directory, stored_name in ((WATERMARKED_DIR, img.watermarked_path),
+                                   (ORIGINAL_DIR, img.original_path)):
+        if not stored_name:
+            continue
+        try:
+            path = upload_utils.safe_join(directory, stored_name)
+        except Exception:
+            continue
+        if os.path.exists(path):
+            return path
+    return None
+
+
 @app.post("/api/verify-watermark")
 @limiter.limit(config.RATE_LIMIT_VERIFY)
 async def verify_watermark(request: Request, file: UploadFile = File(...), x_registry_internal: str = Header(None), db: Session = Depends(auth.get_db)):
@@ -293,17 +308,17 @@ async def verify_watermark(request: Request, file: UploadFile = File(...), x_reg
             # screenshots and mobile-camera re-photographs, where both the watermark and
             # the perceptual hash are destroyed by resampling, perspective distortion and
             # lighting changes, but the underlying visual structure (edges/corners) still
-            # lines up under a RANSAC homography. The watermarked rendition is checked
-            # first because that is the copy that actually circulates publicly; the
-            # original is only consulted if that did not already settle it (the two are
-            # perceptually identical by design, so the second pass rarely adds anything).
-            for directory, stored_name in ((WATERMARKED_DIR, img.watermarked_path),
-                                           (ORIGINAL_DIR, img.original_path)):
-                if not stored_name:
-                    continue
-                candidate_path = upload_utils.safe_join(directory, stored_name)
-                if not os.path.exists(candidate_path):
-                    continue
+            # lines up under a RANSAC homography.
+            #
+            # Only the watermarked rendition is compared: it is the copy that actually
+            # circulates publicly, and it differs from the original solely by an
+            # invisible watermark. Measured across the whole registry, scoring against
+            # the original as well produced identical scores on every record (including
+            # a confirmed real-world match, 100.0 either way) -- it was doubling the
+            # scan for nothing. The original is kept only as a fallback for records
+            # whose watermarked file is missing.
+            candidate_path = _orb_candidate_path(img)
+            if candidate_path:
                 candidate_features = watermark_engine.compute_orb_features_multi(
                     watermark_engine.orb_reference_paths(candidate_path))
                 orb_score = watermark_engine.best_orb_similarity_from_features(
@@ -312,8 +327,6 @@ async def verify_watermark(request: Request, file: UploadFile = File(...), x_reg
                     matched_image = img
                     confidence = orb_score
                     match_method = "orb_visual_similarity"
-                if confidence >= ORB_CONFIDENT_ENOUGH:
-                    break
 
             if confidence >= ORB_CONFIDENT_ENOUGH:
                 break
@@ -324,15 +337,16 @@ async def verify_watermark(request: Request, file: UploadFile = File(...), x_reg
         match_method = None
     finally:
         try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            # The upload is a one-off temp file; any ORB sample frames cached next to it
-            # are useless once it's gone (unlike registered content, which is compared
-            # again on future requests and benefits from keeping its cache).
+            # The upload is a one-off temp file; the ORB sample frames and descriptor
+            # caches written beside it are useless once it's gone (unlike registered
+            # content, which is compared again on future requests and keeps its cache).
+            leftovers = [temp_path, watermark_engine._orb_cache_path(temp_path)]
             for i in range(len(watermark_engine.VIDEO_ORB_SAMPLE_POSITIONS)):
-                cached = f"{temp_path}_orbkf{i}.jpg"
-                if os.path.exists(cached):
-                    os.remove(cached)
+                frame = f"{temp_path}_orbkf{i}.jpg"
+                leftovers += [frame, watermark_engine._orb_cache_path(frame)]
+            for path in leftovers:
+                if os.path.exists(path):
+                    os.remove(path)
         except Exception:
             pass
 

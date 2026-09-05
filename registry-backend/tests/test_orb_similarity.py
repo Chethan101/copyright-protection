@@ -6,6 +6,8 @@ inliers as `max(75.0, ...)`, i.e. an automatic 75+ "confidence". Unrelated image
 routinely produce a handful of chance inliers, so uploading an unregistered photo
 could be blocked and misattributed to a stranger's registered content.
 """
+import os
+
 import cv2
 import numpy as np
 import pytest
@@ -130,6 +132,40 @@ def test_score_is_bounded(tmp_path):
     b = _write(tmp_path, "y.png", _photo(seed=4))
     for score in (we.calculate_orb_similarity(a, a), we.calculate_orb_similarity(a, b)):
         assert 0.0 <= score <= 100.0
+
+
+def test_descriptor_cache_returns_identical_features(tmp_path):
+    """
+    Cached descriptors must be byte-identical to freshly computed ones -- the cache is
+    a pure speedup (registered content is immutable and was being re-described on every
+    single verification), so it must never change a score.
+    """
+    path = _write(tmp_path, "cached.png", _photo(seed=21))
+
+    fresh = we.compute_orb_features(path, use_cache=False)
+    first = we.compute_orb_features(path)   # computes and writes the cache
+    second = we.compute_orb_features(path)  # served from cache
+
+    assert np.array_equal(fresh[0], second[0])
+    assert np.array_equal(fresh[1], second[1])
+    assert np.array_equal(first[1], second[1])
+
+    other = _write(tmp_path, "other.png", _photo(seed=22))
+    assert we.calculate_orb_similarity(path, other) == we.orb_similarity_from_features(
+        fresh, we.compute_orb_features(other, use_cache=False)
+    )
+
+
+def test_descriptor_cache_is_rejected_when_the_file_changes(tmp_path):
+    """A replaced file must never be matched using a description of its old contents."""
+    path = _write(tmp_path, "changing.png", _photo(seed=31))
+    before = we.compute_orb_features(path)
+
+    os.utime(path, (0, 0))  # force a different mtime than the cache recorded
+    cv2.imwrite(path, _photo(seed=32))
+    after = we.compute_orb_features(path)
+
+    assert not np.array_equal(before[1], after[1])
 
 
 def test_low_keypoint_image_does_not_inflate_match_ratio(tmp_path):

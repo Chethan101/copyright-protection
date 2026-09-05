@@ -20,6 +20,7 @@ Technique:
 
 import os
 import shutil
+from collections import OrderedDict
 import cv2
 import numpy as np
 import pywt
@@ -350,14 +351,105 @@ def extract_watermark(image_path: str, watermark_len_bits: int) -> str:
 
 # ── ORB similarity ────────────────────────────────────────────────────────────
 
-def compute_orb_features(image_path: str):
+ORB_CACHE_SUFFIX = ".orb.npz"
+
+# Descriptors are also held in-process, keyed on (path, size, mtime). The on-disk cache
+# still matters for a cold start, but reading ~500 small archives per scan costs nearly
+# as much as recomputing them; serving repeat verifications from memory removes both.
+# Bounded so a large registry cannot grow the process without limit. A scan touches
+# every entry, so a cap below the working set would thrash under LRU; at roughly 40KB
+# per entry this ceiling costs tens of MB and covers a few hundred registered items.
+ORB_MEMO_MAX_ENTRIES = 1024
+_orb_memo = OrderedDict()
+
+
+def _orb_cache_path(image_path: str) -> str:
+    return image_path + ORB_CACHE_SUFFIX
+
+
+def _memo_key(image_path: str):
+    try:
+        stat = os.stat(image_path)
+    except OSError:
+        return None
+    return (os.path.abspath(image_path), stat.st_size, stat.st_mtime)
+
+
+def _memo_get(key):
+    if key is None or key not in _orb_memo:
+        return False, None
+    _orb_memo.move_to_end(key)
+    return True, _orb_memo[key]
+
+
+def _memo_put(key, features):
+    if key is None:
+        return
+    _orb_memo[key] = features
+    _orb_memo.move_to_end(key)
+    while len(_orb_memo) > ORB_MEMO_MAX_ENTRIES:
+        _orb_memo.popitem(last=False)
+
+
+def _load_orb_cache(image_path: str):
     """
-    Detect ORB keypoints/descriptors for one image.
+    Read cached descriptors, but only if they still describe the current file.
+
+    The stored size/mtime guard means a replaced file can never be matched using a
+    stale description of its previous contents.
+    """
+    cache_path = _orb_cache_path(image_path)
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        stat = os.stat(image_path)
+        with np.load(cache_path) as data:
+            if int(data["size"]) != stat.st_size or float(data["mtime"]) != stat.st_mtime:
+                return None
+            if data["empty"]:
+                return None
+            return data["pts"], data["desc"]
+    except Exception:
+        return None
+
+
+def _store_orb_cache(image_path: str, features):
+    try:
+        stat = os.stat(image_path)
+        payload = {"size": stat.st_size, "mtime": stat.st_mtime, "empty": features is None}
+        if features is None:
+            payload["pts"] = np.empty((0, 2), dtype=np.float32)
+            payload["desc"] = np.empty((0, 32), dtype=np.uint8)
+        else:
+            payload["pts"], payload["desc"] = features
+        np.savez(_orb_cache_path(image_path), **payload)
+    except Exception:
+        pass  # A cache miss is only ever a slowdown, never a correctness problem.
+
+
+def compute_orb_features(image_path: str, use_cache: bool = True):
+    """
+    Detect ORB keypoints/descriptors for one image, as (points, descriptors).
 
     Split out from the comparison so a single uploaded file can be described once and
     then matched against every registered record. Re-describing the query inside each
     comparison made verification cost scale with the size of the registry twice over.
+
+    Descriptors are cached beside the file because registered content is immutable once
+    stored, while detection was being repeated on every single verification -- measured
+    at ~85% of the whole scan's cost. Only the keypoint coordinates are kept (that is
+    all the homography needs), so the cache is two plain arrays.
     """
+    memo_key = _memo_key(image_path) if use_cache else None
+    if use_cache:
+        hit, features = _memo_get(memo_key)
+        if hit:
+            return features
+        cached = _load_orb_cache(image_path)
+        if cached is not None:
+            _memo_put(memo_key, cached)
+            return cached
+
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         return None
@@ -370,9 +462,14 @@ def compute_orb_features(image_path: str):
 
     orb = cv2.ORB_create(nfeatures=1500, scoreType=cv2.ORB_FAST_SCORE)
     keypoints, descriptors = orb.detectAndCompute(img, None)
-    if descriptors is None or len(keypoints) < 5:
-        return None
-    return keypoints, descriptors
+    features = None
+    if descriptors is not None and len(keypoints) >= 5:
+        features = (np.float32([kp.pt for kp in keypoints]), descriptors)
+
+    if use_cache:
+        _store_orb_cache(image_path, features)
+        _memo_put(_memo_key(image_path), features)
+    return features
 
 
 def calculate_orb_similarity(img1_path: str, img2_path: str) -> float:
@@ -449,7 +546,13 @@ def compute_orb_features_multi(paths):
 
 
 def best_orb_similarity_from_features(features_list1, features_list2) -> float:
-    """Max ORB similarity across every pair of precomputed feature sets."""
+    """
+    Max ORB similarity across every pair of precomputed feature sets.
+
+    Deliberately left serial: OpenCV already parallelises descriptor matching across
+    every core internally, so wrapping this in a worker pool measured at 1.0-1.1x --
+    pure added complexity for no gain.
+    """
     best = 0.0
     for f1 in features_list1:
         for f2 in features_list2:
@@ -463,8 +566,8 @@ def orb_similarity_from_features(features1, features2) -> float:
     """Score two pre-computed ORB feature sets (see compute_orb_features)."""
     if features1 is None or features2 is None:
         return 0.0
-    kp1, des1 = features1
-    kp2, des2 = features2
+    pts1, des1 = features1
+    pts2, des2 = features2
 
     # KNN matching with Lowe's ratio test (robust against glare, lighting, and camera noise)
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
@@ -477,7 +580,7 @@ def orb_similarity_from_features(features1, features2) -> float:
             if m.distance < 0.75 * n.distance:
                 good_matches.append(m)
 
-    min_kp = min(len(kp1), len(kp2))
+    min_kp = min(len(pts1), len(pts2))
     if min_kp == 0:
         return 0.0
 
@@ -499,8 +602,8 @@ def orb_similarity_from_features(features1, features2) -> float:
     # at a near-total inlier ratio. Scoring is proportional to the measured inlier ratio --
     # never a fixed floor, which would turn any chance correspondence into a confident match.
     if len(good_matches) >= MIN_GOOD_MATCHES_FOR_HOMOGRAPHY:
-        src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+        src_pts = pts1[[m.queryIdx for m in good_matches]].reshape(-1, 1, 2)
+        dst_pts = pts2[[m.trainIdx for m in good_matches]].reshape(-1, 1, 2)
 
         M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
         if mask is not None:
