@@ -44,26 +44,55 @@ JPEG_QUALITY = 97    # High quality to minimise compression artefacts
 # Use mid-frequency DCT positions — not too low (visible) not too high (destroyed by JPEG)
 EMBED_POSITIONS = [(3, 4), (4, 3), (4, 4), (3, 5), (5, 3)]
 
-# ORB/RANSAC gates. Measured against this project's own corpus: genuine derived copies
-# (exact / screenshot / crop / camera re-capture) yield 500+ inliers at >=97% inlier ratio,
-# while unrelated rich-texture photographs peak at ~8 chance inliers from <=15 good
-# matches. Raised from an initial 20 after multi-frame video sampling surfaced a second
-# class of false positive: low-texture, geometrically simple content (flat-color blocks
-# on a gradient -- e.g. a screen recording or slideshow) has few enough keypoints that
-# unrelated clips can reach 21-25 good matches at 76-91% inlier ratio by chance, since a
-# small, generic feature set (axis-aligned corners) is far less discriminating than the
-# rich texture of a real photo. A genuine match's *weakest* winning frame pair among
-# real content still cleared 41 good matches, so 30 keeps a safety margin on both sides.
-MIN_GOOD_MATCHES_FOR_HOMOGRAPHY = 30
-MIN_HOMOGRAPHY_INLIERS = 25
+# ORB/RANSAC gates -- calibrated against this project's whole registry (every pair of
+# different registered items, plus genuine copies of real registered photos/videos).
+#
+# Coincidental geometric matches between unrelated content never exceeded 36 inliers;
+# genuine copies of real content started at 72 (an extreme 50% crop) and were
+# typically in the hundreds (a real trimmed video re-upload: 507). The inlier ratio
+# did NOT separate them (coincidences reached 57-90%), so the absolute count is the
+# primary gate, set with margin on both sides.
+#
+# Earlier, smaller gates (20/25 inliers) let an unrelated photo be scored "100%"
+# against an out-of-focus video frame -- and because that video belonged to the
+# uploader, it waved through someone else's registered content.
+MIN_GOOD_MATCHES_FOR_HOMOGRAPHY = 50
+MIN_HOMOGRAPHY_INLIERS = 50
 MIN_INLIER_RATIO = 40.0
+# Share of each picture's detailed region a verified match must span (see
+# orb_similarity_from_features). Genuine copies span >= 0.48 of at least one side
+# (usually ~1.0); a crop is small only on the side it was cut from (as low as 0.04).
+# Unrelated screen recordings can line up on shared UI chrome over a tiny region
+# (~0.02-0.03 of both sides), and degenerate homographies collapse one side to ~0.
+MIN_MATCH_COVERAGE = 0.25       # on at least one side
+MIN_MATCH_COVERAGE_BOTH = 0.02  # on both sides
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def get_perceptual_hash(image_path):
+def get_perceptual_hash(image_path, hash_size=16):
     img = Image.open(image_path).convert('RGB')
-    return str(imagehash.phash(img, hash_size=16))   # 256-bit for accuracy
+    return str(imagehash.phash(img, hash_size=hash_size))   # 16 -> 256-bit for accuracy
+
+
+# A perceptual hash is the sign pattern of low-frequency DCT terms. On a near-uniform
+# picture those terms are all ~0, so the pattern is noise and any two flat images look
+# "identical" (measured: a plain blue and a plain green test image, 5 bits apart). Below
+# this grey-level spread the hash is not used as evidence. Measured spread: flat test
+# images 0.7-6.2; the dimmest of 25 real photos 16.1; registry median 32.
+MIN_DETAIL_FOR_PHASH = 10.0
+
+
+def perceptual_detail(path) -> float:
+    """Grey-level standard deviation of a 64x64 rendering (video: a representative frame)."""
+    if is_video_file(path):
+        frame = _representative_frame(path)
+        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)) if frame is not None else None
+    else:
+        img = Image.open(path)
+    if img is None:
+        return 0.0
+    return float(np.asarray(img.convert('L').resize((64, 64), Image.LANCZOS), dtype=np.float32).std())
 
 
 def apply_dct_2d(block):
@@ -545,6 +574,24 @@ def compute_orb_features_multi(paths):
     return [f for f in (compute_orb_features(p) for p in paths) if f is not None]
 
 
+def best_orb_match(features_list1, features_list2):
+    """
+    Strongest (score, inliers) across every pair of precomputed feature sets.
+
+    Ranked by score, then by inliers: the cap makes many genuine matches score 100,
+    and when the same picture is registered more than once, the record a copy was
+    actually made from lines up far better (measured: 903 vs 317 inliers) -- which
+    is what decides which registration to cite.
+    """
+    best = (0.0, 0)
+    for f1 in features_list1:
+        for f2 in features_list2:
+            strength = orb_match_strength(f1, f2)
+            if strength > best:
+                best = strength
+    return best
+
+
 def best_orb_similarity_from_features(features_list1, features_list2) -> float:
     """
     Max ORB similarity across every pair of precomputed feature sets.
@@ -562,57 +609,92 @@ def best_orb_similarity_from_features(features_list1, features_list2) -> float:
     return best
 
 
-def orb_similarity_from_features(features1, features2) -> float:
-    """Score two pre-computed ORB feature sets (see compute_orb_features)."""
-    if features1 is None or features2 is None:
+def _bbox_area(points):
+    xy = points.reshape(-1, 2)
+    return float((xy[:, 0].max() - xy[:, 0].min()) * (xy[:, 1].max() - xy[:, 1].min()))
+
+
+def _match_coverage(inlier_points, all_points):
+    """
+    How much of an image's feature-bearing region a verified match spans.
+
+    Measured against the spread of ALL the image's keypoints rather than the full frame:
+    many genuine pictures carry detail in only part of the frame (a subject on a plain
+    background, a gradient sky), so a copy of them can never span the whole frame --
+    but it does span most of the region that actually has detail.
+    """
+    if len(inlier_points) == 0 or len(all_points) == 0:
         return 0.0
+    region = _bbox_area(all_points)
+    return 0.0 if region <= 0 else min(1.0, _bbox_area(inlier_points) / region)
+
+
+def orb_similarity_from_features(features1, features2) -> float:
+    """Score two pre-computed ORB feature sets; see orb_match_strength."""
+    return orb_match_strength(features1, features2)[0]
+
+
+def orb_match_strength(features1, features2):
+    """
+    (score, inliers) for two pre-computed ORB feature sets (see compute_orb_features).
+
+    The score is capped, so many genuine matches tie at 100; the inlier count is the raw
+    evidence that breaks the tie (see best_orb_match).
+
+    A visual match only counts once it is GEOMETRICALLY verified. Every way a copy is
+    made -- exact re-upload, screenshot, crop, re-photograph, trimmed video -- leaves
+    the copy as a projective transform of the original, so its matched points line up
+    under one homography (measured on real copies: hundreds of inliers at 60-97%).
+    Coincidental descriptor matches do not: measured on a real false block, an
+    unrelated photo had 37 raw matches against an out-of-focus video frame but only 9
+    that lined up (24%) -- and an earlier ratio-only score turned that into "100%"
+    because the frame had just 94 keypoints in total.
+
+    Two gates therefore stand between raw matches and any score:
+      1. RANSAC homography with enough inliers at a high enough inlier ratio;
+      2. those inliers must span a real part of the picture. Many registered clips are
+         screen recordings sharing identical UI chrome (e.g. a "Stop recording" button):
+         two unrelated recordings genuinely line up on that small region. A real copy
+         covers a large share of at least one side's detailed region (a crop is small
+         only on the side it was cut from), and some share of both -- which also rules
+         out degenerate homographies that collapse a large region onto a point.
+    """
+    if features1 is None or features2 is None:
+        return 0.0, 0
     pts1, des1 = features1
     pts2, des2 = features2
+
+    min_kp = min(len(pts1), len(pts2))
+    if min_kp == 0:
+        return 0.0, 0
 
     # KNN matching with Lowe's ratio test (robust against glare, lighting, and camera noise)
     bf = cv2.BFMatcher(cv2.NORM_HAMMING)
     matches = bf.knnMatch(des1, des2, k=2)
+    good_matches = [m for pair in matches if len(pair) == 2
+                    for m, n in [pair] if m.distance < 0.75 * n.distance]
+    if len(good_matches) < MIN_GOOD_MATCHES_FOR_HOMOGRAPHY:
+        return 0.0, 0
 
-    good_matches = []
-    for m_pair in matches:
-        if len(m_pair) == 2:
-            m, n = m_pair
-            if m.distance < 0.75 * n.distance:
-                good_matches.append(m)
+    src_pts = pts1[[m.queryIdx for m in good_matches]].reshape(-1, 1, 2)
+    dst_pts = pts2[[m.trainIdx for m in good_matches]].reshape(-1, 1, 2)
+    _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    if mask is None:
+        return 0.0, 0
+    inlier_mask = mask.ravel().astype(bool)
+    inliers = int(inlier_mask.sum())
+    inlier_ratio = (inliers / len(good_matches)) * 100.0
+    if inliers < MIN_HOMOGRAPHY_INLIERS or inlier_ratio < MIN_INLIER_RATIO:
+        return 0.0, 0
 
-    min_kp = min(len(pts1), len(pts2))
-    if min_kp == 0:
-        return 0.0
+    cov1 = _match_coverage(src_pts[inlier_mask], pts1)
+    cov2 = _match_coverage(dst_pts[inlier_mask], pts2)
+    if max(cov1, cov2) < MIN_MATCH_COVERAGE or min(cov1, cov2) < MIN_MATCH_COVERAGE_BOTH:
+        return 0.0, 0
 
-    # Feature match score based on good match ratio. Gated on an ABSOLUTE match count,
-    # not just the ratio: when one image has very few keypoints (a blurry or otherwise
-    # low-texture frame), a handful of coincidental matches becomes a large fraction of
-    # a tiny denominator and inflates the ratio, even against genuinely unrelated content.
-    # Measured on a real out-of-focus frame: 17 matches out of 90 keypoints scored 75.6
-    # (well above the 50 block threshold) against completely unrelated footage, while a
-    # confirmed genuine match on the same clip produced 544 matches. The gate below is
-    # shared with the homography check for the same reason: both need enough raw
-    # correspondence to be trustworthy at all, not just a good proportion of a small set.
-    score = min(100.0, (len(good_matches) / min_kp) * 100.0 * 4.0) \
-        if len(good_matches) >= MIN_GOOD_MATCHES_FOR_HOMOGRAPHY else 0.0
-
-    # RANSAC Homography check (confirms geometric structure even if photo taken from mobile screen).
-    # Gates are deliberately strict: unrelated images routinely produce a handful of chance
-    # inliers, while a genuine re-capture/crop/screenshot of the same content yields hundreds
-    # at a near-total inlier ratio. Scoring is proportional to the measured inlier ratio --
-    # never a fixed floor, which would turn any chance correspondence into a confident match.
-    if len(good_matches) >= MIN_GOOD_MATCHES_FOR_HOMOGRAPHY:
-        src_pts = pts1[[m.queryIdx for m in good_matches]].reshape(-1, 1, 2)
-        dst_pts = pts2[[m.trainIdx for m in good_matches]].reshape(-1, 1, 2)
-
-        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-        if mask is not None:
-            inliers = int(np.sum(mask))
-            inlier_ratio = (inliers / len(good_matches)) * 100.0
-            if inliers >= MIN_HOMOGRAPHY_INLIERS and inlier_ratio >= MIN_INLIER_RATIO:
-                score = max(score, min(99.0, inlier_ratio))
-
-    return round(float(score), 2)
+    # Verified: the strength of the evidence sets the confidence.
+    ratio_score = min(100.0, (len(good_matches) / min_kp) * 100.0 * 4.0)
+    return round(float(max(ratio_score, min(99.0, inlier_ratio))), 2), inliers
 
 
 # ── Video Support ─────────────────────────────────────────────────────────────
@@ -837,7 +919,7 @@ def get_video_perceptual_hash(video_path: str) -> str:
     return str(imagehash.phash(pil_img, hash_size=16))
 
 
-def get_video_perceptual_hash_candidates(video_path: str):
+def get_video_perceptual_hash_candidates(video_path: str, hash_size: int = 16):
     """
     Perceptual hashes for the frame positions a stored video hash could have come from.
 
@@ -853,11 +935,11 @@ def get_video_perceptual_hash_candidates(video_path: str):
         if frame is None:
             continue
         digest = str(imagehash.phash(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)),
-                                     hash_size=16))
+                                     hash_size=hash_size))
         if digest not in seen:
             seen.add(digest)
             hashes.append(digest)
-    return hashes or [get_perceptual_hash(video_path)]
+    return hashes or [get_perceptual_hash(video_path, hash_size)]
 
 def extract_keyframe(video_path: str, output_image_path: str) -> bool:
     """Writes a representative still from the video for ORB/thumbnail matching."""

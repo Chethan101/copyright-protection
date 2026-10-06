@@ -12,6 +12,7 @@ from . import models, auth, upload_utils, config
 import os, uuid, requests
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from datetime import timezone
 
 Base.metadata.create_all(bind=engine)
 
@@ -41,6 +42,19 @@ UPLOAD_DIR = os.path.join(os.path.dirname(__file__), 'uploads')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 REGISTRY_URL = config.REGISTRY_URL
 
+
+def utc_iso(dt):
+    """
+    Serialize a stored timestamp as explicit UTC (e.g. ...+00:00).
+
+    Timestamps are stored as naive UTC (datetime.utcnow). Sent without an offset, a
+    browser reads them as LOCAL time -- in India every post then appeared 5h30m older
+    than it was ("5h ago" for something just posted).
+    """
+    if dt is None:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/register")
@@ -66,6 +80,40 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     token = auth.create_access_token(data={"sub": user.username, "user_id": user.id})
     return {"access_token": token, "token_type": "bearer", "username": user.username, "user_id": user.id}
 
+# ── Copyright registry session ────────────────────────────────────────────────
+
+@app.post("/api/registry/session")
+def registry_session(current_user: models.User = Depends(auth.get_current_user)):
+    """
+    Hand the Registry tab a registry session for the signed-in VibeSocial user.
+
+    The registry is a separate service with its own signing key, and the two backends
+    reject each other's tokens on purpose -- so rather than sharing a key, this vouches
+    for the already-authenticated user over the internal channel the copyright check
+    already uses, and passes back the registry's own token.
+
+    The registry account is provisioned under the same username, which is what makes a
+    creator the owner of what they register: ownership is attributed by username across
+    the two services, so posting your own registered work is recognised as yours.
+    """
+    try:
+        resp = requests.post(
+            f"{REGISTRY_URL}/internal/session",
+            data={"username": current_user.username},
+            headers={"x-registry-internal": config.INTERNAL_API_KEY},
+            timeout=config.REGISTRY_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="The registry service is not reachable right now.")
+    if resp.status_code == 409:
+        # A registry-only account already holds this username; the registry refuses to
+        # hand it over (it may belong to someone else). Pass the explanation through.
+        raise HTTPException(status_code=409, detail=resp.json().get("detail", "Registry account conflict"))
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=503, detail="The registry service is not reachable right now.")
+    return resp.json()
+
+
 # ── Posts ─────────────────────────────────────────────────────────────────────
 
 def _post_dict(p: models.Post, db: Session, current_user_id: int = None):
@@ -78,14 +126,14 @@ def _post_dict(p: models.Post, db: Session, current_user_id: int = None):
     comments = []
     for c in sorted(p.comments, key=lambda x: x.timestamp):
         commenter = db.query(models.User).filter(models.User.id == c.user_id).first()
-        comments.append({"id": c.id, "user_id": c.user_id, "username": commenter.username if commenter else "?", "text": c.text, "timestamp": c.timestamp.isoformat()})
+        comments.append({"id": c.id, "user_id": c.user_id, "username": commenter.username if commenter else "?", "text": c.text, "timestamp": utc_iso(c.timestamp)})
     return {
         "id": p.id,
         "uploader": uploader.username if uploader else "Unknown",
         "uploader_id": p.uploader_id,
         "image_url": f"/api/images/{p.image_path}",
         "caption": p.caption or "",
-        "timestamp": p.timestamp.isoformat(),
+        "timestamp": utc_iso(p.timestamp),
         "likes_count": len(p.likes),
         "liked": liked,
         "saved": saved,
@@ -258,7 +306,7 @@ def add_comment(post_id: int, body: CommentBody, current_user: models.User = Dep
         raise HTTPException(status_code=400, detail="Comment cannot be empty")
     comment = models.Comment(user_id=current_user.id, post_id=post_id, text=body.text.strip())
     db.add(comment); db.commit(); db.refresh(comment)
-    return {"id": comment.id, "username": current_user.username, "text": comment.text, "timestamp": comment.timestamp.isoformat()}
+    return {"id": comment.id, "username": current_user.username, "text": comment.text, "timestamp": utc_iso(comment.timestamp)}
 
 @app.delete("/api/comments/{comment_id}")
 def delete_comment(comment_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
@@ -295,8 +343,10 @@ def get_violations(current_user: models.User = Depends(auth.get_current_user), d
     # compared against current_user.id here. original_owner_name (a plain username
     # string) is the only field both services agree on; match on that instead.
     alerts = db.query(models.ViolationLog).filter(models.ViolationLog.original_owner_name == current_user.username).order_by(models.ViolationLog.timestamp.desc()).all()
+    usernames = {u.id: u.username for u in db.query(models.User).filter(
+        models.User.id.in_({v.attempted_by_id for v in violations + alerts})).all()}
     def v_dict(v):
-        return {"id": v.id, "attempted_by_id": v.attempted_by_id, "original_owner_name": v.original_owner_name, "tx_hash": v.tx_hash, "confidence_score": v.confidence_score, "match_method": v.match_method, "reason": v.reason, "timestamp": v.timestamp.isoformat()}
+        return {"id": v.id, "attempted_by_id": v.attempted_by_id, "attempted_by_username": usernames.get(v.attempted_by_id), "original_owner_name": v.original_owner_name, "tx_hash": v.tx_hash, "confidence_score": v.confidence_score, "match_method": v.match_method, "reason": v.reason, "timestamp": utc_iso(v.timestamp)}
     return {"my_violations": [v_dict(v) for v in violations], "notifications": [v_dict(v) for v in alerts]}
 
 # ── Static images ─────────────────────────────────────────────────────────────

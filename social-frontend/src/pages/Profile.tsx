@@ -30,7 +30,7 @@ export default function Profile() {
       <div className="profile-header">
         <div className="avatar xl">{data.user.username[0]?.toUpperCase()}</div>
         <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 20, marginBottom: 16 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
             <h2 style={{ fontSize: 24, fontWeight: 300 }}>{data.user.username}</h2>
             {myUsername === username && (
               <button style={{ background: 'var(--surface2)', border: '1px solid var(--border)', color: 'var(--text)', padding: '6px 16px', borderRadius: 8, fontWeight: 700, fontSize: 14, cursor: 'pointer' }}>

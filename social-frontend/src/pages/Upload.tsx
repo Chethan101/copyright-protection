@@ -102,13 +102,13 @@ export default function Upload({ onClose }: { onClose: () => void }) {
 
         {/* Caption step */}
         {step === 'caption' && (
-          <div style={{ display: 'flex', minHeight: 320 }}>
+          <div className="upload-compose">
             {file?.type.startsWith('video/') ? (
-              <video src={preview} controls autoPlay loop muted style={{ width: 260, objectFit: 'cover', borderRadius: '0 0 0 16px' }} />
+              <video src={preview} controls autoPlay loop muted className="upload-compose-media" />
             ) : (
-              <img src={preview} alt="" style={{ width: 260, objectFit: 'cover', borderRadius: '0 0 0 16px' }} />
+              <img src={preview} alt="" className="upload-compose-media" />
             )}
-            <div style={{ flex: 1, padding: 16, display: 'flex', flexDirection: 'column' }}>
+            <div className="upload-compose-form">
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
                 <div className="avatar" style={{ width: 30, height: 30, fontSize: 12 }}>
                   {(localStorage.getItem('social_username') || 'U')[0].toUpperCase()}

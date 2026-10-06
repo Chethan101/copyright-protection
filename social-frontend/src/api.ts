@@ -21,6 +21,7 @@ api.interceptors.response.use(
       localStorage.removeItem(TOKEN_KEY);
       localStorage.removeItem('social_username');
       localStorage.removeItem('social_user_id');
+      localStorage.removeItem('registry_token');
       if (window.location.pathname !== '/login') {
         window.location.href = '/login';
       }

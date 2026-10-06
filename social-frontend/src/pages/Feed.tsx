@@ -1,16 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import api from '../api';
 import { API_BASE_URL } from '../config';
+import { timeAgo, formatIST } from '../time';
 
 const myUsername = () => localStorage.getItem('social_username') || '';
-
-function timeAgo(iso: string) {
-  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (diff < 60) return `${Math.floor(diff)}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
 
 function PostMenu({ post, onDelete }: any) {
   const [open, setOpen] = useState(false);
@@ -185,14 +178,14 @@ function PostCard({ post, onLike, onComment, onRepost, onSave, onDelete }: any) 
             <div>
               <strong>{c.username}</strong>
               {c.text}
-              <div className="comment-time">{timeAgo(c.timestamp)}</div>
+              <div className="comment-time" title={formatIST(c.timestamp)}>{timeAgo(c.timestamp)}</div>
             </div>
           </div>
         ))}
       </div>
 
       {/* Timestamp */}
-      <div className="post-time">{timeAgo(post.timestamp)}</div>
+      <div className="post-time" title={formatIST(post.timestamp)}>{timeAgo(post.timestamp)}</div>
 
       {/* Comment input */}
       <form className="comment-input-row" onSubmit={handleComment}>

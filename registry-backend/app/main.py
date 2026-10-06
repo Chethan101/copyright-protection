@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -10,12 +11,39 @@ from slowapi.errors import RateLimitExceeded
 from .database import engine, Base
 from . import models, auth, watermark_engine, upload_utils, config
 import json, logging, os, uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from web3 import Web3
+
+
+def utc_iso(dt):
+    """
+    Serialize a stored timestamp as explicit UTC (e.g. ...+00:00).
+
+    Timestamps are stored as naive UTC (datetime.utcnow). Sent without an offset, a
+    browser reads them as LOCAL time -- in India every post then appeared 5h30m older
+    than it was ("5h ago" for something just posted).
+    """
+    if dt is None:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
 
 logger = logging.getLogger("registry.blockchain")
 
 Base.metadata.create_all(bind=engine)
+
+
+def _migrate_user_origin():
+    """Add users.origin to databases created before it existed. Accounts that already
+    exist are treated as linked to the VibeSocial account of the same name -- that is how
+    they have been used so far -- so current users keep working."""
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.execute(text("PRAGMA table_info(users)"))}
+        if cols and "origin" not in cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN origin VARCHAR NOT NULL DEFAULT 'social'"))
+
+
+_migrate_user_origin()
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -79,27 +107,35 @@ os.makedirs(ORIGINAL_DIR, exist_ok=True)
 
 INTERNAL_API_KEY = config.INTERNAL_API_KEY
 
-# A visual match this strong will not be beaten by a later candidate, so the scan can
-# stop rather than running ORB against the rest of the registry.
-ORB_CONFIDENT_ENOUGH = 97.0
 
 
 class _Lazy:
     """Defer an expensive computation until (and unless) it is actually needed."""
 
-    __slots__ = ("_factory", "_value", "_done")
+    __slots__ = ("_factory", "_value", "_done", "_error")
 
     def __init__(self, factory):
         self._factory = factory
         self._value = None
         self._done = False
+        self._error = None
 
     @property
     def value(self):
+        if self._error is not None:
+            raise self._error          # failed once: don't recompute it for every record
         if not self._done:
-            self._value = self._factory()
+            try:
+                self._value = self._factory()
+            except Exception as exc:
+                self._error = exc
+                raise
             self._done = True
         return self._value
+
+
+class _UploadUnreadable(Exception):
+    """The uploaded file itself could not be analysed -- the check must fail closed."""
 
 
 @app.post("/api/register")
@@ -108,7 +144,7 @@ def register(username: str = Form(...), password: str = Form(...), db: Session =
     username = username.strip()
     if db.query(models.User).filter(models.User.username == username).first():
         raise HTTPException(status_code=400, detail="Username already registered")
-    user = models.User(username=username, password_hash=auth.get_password_hash(password))
+    user = models.User(username=username, password_hash=auth.get_password_hash(password), origin="registry")
     db.add(user)
     try:
         db.commit()
@@ -124,6 +160,59 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         raise HTTPException(status_code=400, detail="Incorrect credentials")
     access_token = auth.create_access_token(data={"sub": user.username, "user_id": user.id})
     return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/api/internal/session")
+def internal_session(username: str = Form(...), x_registry_internal: str = Header(None),
+                     db: Session = Depends(auth.get_db)):
+    """
+    Issue a registry session for a user another trusted service has already authenticated.
+
+    VibeSocial embeds this registry and brokers sign-in through here so a creator does not
+    keep a second account: it presents the shared internal key plus the username it has
+    already authenticated, and gets back a normal registry token for that same username.
+
+    Matching on username is what makes ownership work end to end -- the two services have
+    independent id spaces, so a copyright block is attributed by username. Provisioning the
+    registry account under the caller's exact username is therefore what lets a creator post
+    their own registered work; a mismatch would have them blocked from their own content.
+
+    The account is created without a usable password, so it is reachable only through this
+    brokered path. Accounts created through the registry's own signup are never handed
+    out here, even when the username matches.
+    """
+    if x_registry_internal != INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    username = (username or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username cannot be empty")
+    if len(username) > 64:
+        raise HTTPException(status_code=400, detail="Username too long")
+
+    user = db.query(models.User).filter(models.User.username == username).first()
+    if user and user.origin != "social":
+        # Someone created this name directly on the registry. It is not necessarily the
+        # same person as the VibeSocial user, so never hand over its session.
+        logger.warning("Refusing brokered session for registry-only account %r", username)
+        raise HTTPException(status_code=409, detail=(
+            "A separate CopyGuard account already uses this username, so it cannot be linked automatically."))
+    if not user:
+        user = models.User(username=username, password_hash=auth.unusable_password_hash(), origin="social")
+        db.add(user)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Raced with another request for the same new user -- reuse the winner.
+            db.rollback()
+            user = db.query(models.User).filter(models.User.username == username).first()
+            if not user:
+                raise HTTPException(status_code=500, detail="Could not provision registry account")
+        else:
+            db.refresh(user)
+
+    token = auth.create_access_token(data={"sub": user.username, "user_id": user.id})
+    return {"access_token": token, "token_type": "bearer", "username": user.username, "user_id": user.id}
+
 
 @app.post("/api/images/register")
 @limiter.limit(config.RATE_LIMIT_REGISTER)
@@ -149,6 +238,34 @@ async def register_image(request: Request, file: UploadFile = File(...), current
         os.remove(original_path)
         raise HTTPException(status_code=400, detail="Image or video already registered")
 
+    # Each piece of content is registered exactly ONCE. The hash check above only
+    # catches a byte-identical file; a screenshot, crop, re-save or re-photograph of
+    # registered content sailed through and was minted again:
+    #   * by someone else -- that person then "owned" a copy and could post the
+    #     original's content freely (found here: one photo under two accounts);
+    #   * by the same owner -- two registrations of one picture, so a block could cite
+    #     either one, not the one the user registered (found here: #92 and #93).
+    # The same matcher that guards uploads decides it, and it fails closed.
+    try:
+        # Off the event loop: a full-registry scan must not stall concurrent upload checks.
+        prior, _, _ = await run_in_threadpool(_find_registered_match, original_path, db)
+    except Exception:
+        logger.exception("Ownership check failed during registration")
+        _cleanup_query_files(original_path)
+        raise HTTPException(status_code=503, detail="Ownership check could not be completed")
+    if prior is not None:
+        _cleanup_query_files(original_path)
+        if prior.owner_id == current_user.id:
+            raise HTTPException(status_code=409, detail=(
+                f"You already registered this content (watermark {prior.watermark_id}, "
+                f"tx {prior.tx_hash[:18]}...). It is already protected."
+            ))
+        prior_owner = db.query(models.User).filter(models.User.id == prior.owner_id).first()
+        raise HTTPException(status_code=409, detail=(
+            f"This content is already registered by @{prior_owner.username if prior_owner else 'another user'}"
+            " and cannot be registered by anyone else."
+        ))
+
     # Generate watermark_id FIRST so it's consistent in both DB and blockchain
     watermark_id = str(uuid.uuid4())[:8]
     watermark_bits = watermark_engine.str_to_binary(watermark_id)
@@ -160,12 +277,11 @@ async def register_image(request: Request, file: UploadFile = File(...), current
 
     try:
         if is_video:
-            watermark_engine.embed_video_watermark(original_path, watermark_bits, output_path)
+            await run_in_threadpool(watermark_engine.embed_video_watermark, original_path, watermark_bits, output_path)
         else:
-            watermark_engine.embed_watermark(original_path, watermark_bits, output_path)
+            await run_in_threadpool(watermark_engine.embed_watermark, original_path, watermark_bits, output_path)
     except Exception:
-        if os.path.exists(original_path):
-            os.remove(original_path)
+        _cleanup_query_files(original_path)
         if os.path.exists(output_path):
             os.remove(output_path)
         raise HTTPException(status_code=400, detail="Unsupported or corrupt file")
@@ -178,7 +294,7 @@ async def register_image(request: Request, file: UploadFile = File(...), current
         try:
             owner_id, wm_id, ts, is_reg = CopyrightRegistry.functions.verifyImage(image_hash).call()
             if is_reg:
-                os.remove(original_path)
+                _cleanup_query_files(original_path)
                 os.remove(output_path)
                 raise HTTPException(status_code=400, detail="Image already registered on blockchain")
             # Pass `from` explicitly rather than relying on w3.eth.default_account being
@@ -187,7 +303,7 @@ async def register_image(request: Request, file: UploadFile = File(...), current
             # default_account is set.
             tx_hash = CopyrightRegistry.functions.registerImage(image_hash, str(current_user.id), watermark_id).transact({"from": w3.eth.default_account})
             w3.eth.wait_for_transaction_receipt(tx_hash)
-            tx_hash_hex = tx_hash.hex()
+            tx_hash_hex = Web3.to_hex(tx_hash)  # 0x-prefixed, as block explorers show it
             receipt = w3.eth.get_transaction_receipt(tx_hash)
             block_number = receipt.blockNumber
             blockchain_registered = True
@@ -205,12 +321,14 @@ async def register_image(request: Request, file: UploadFile = File(...), current
         db.commit()
     except IntegrityError:
         db.rollback()
-        if os.path.exists(original_path):
-            os.remove(original_path)
+        _cleanup_query_files(original_path)
         if os.path.exists(output_path):
             os.remove(output_path)
         raise HTTPException(status_code=400, detail="Image or video already registered")
     db.refresh(img_record)
+    # The ownership check analysed the original; scans only ever use the watermarked copy,
+    # so those caches would never be read again.
+    _cleanup_analysis_files(original_path)
 
     return {
         "msg": "Transaction Successful" if blockchain_registered else "Registered successfully (blockchain notarization unavailable, recorded in registry only)",
@@ -238,6 +356,160 @@ def _orb_candidate_path(img):
     return None
 
 
+BLOCK_CONFIDENCE = 50.0  # a match must exceed this to count as "registered"
+
+
+class _SkipLayer(Exception):
+    """Internal: this evidence layer does not apply to the current upload."""
+
+
+def _cleanup_analysis_files(path):
+    """Remove the ORB sample frames / descriptor caches written beside an analysed file."""
+    _remove_files(_analysis_files(path))
+
+
+def _cleanup_query_files(path):
+    """Remove an analysed file plus the ORB sample frames / descriptor caches beside it."""
+    _remove_files([path] + _analysis_files(path))
+
+
+def _analysis_files(path):
+    leftovers = [watermark_engine._orb_cache_path(path)]
+    for i in range(len(watermark_engine.VIDEO_ORB_SAMPLE_POSITIONS)):
+        frame = f"{path}_orbkf{i}.jpg"
+        leftovers += [frame, watermark_engine._orb_cache_path(frame)]
+    return leftovers
+
+
+def _remove_files(paths):
+    for leftover in paths:
+        try:
+            if os.path.exists(leftover):
+                os.remove(leftover)
+        except OSError:
+            pass
+
+
+def _find_registered_match(path, db):
+    """
+    Find the registered item a file is a copy of: (record, confidence, method) or
+    (None, 0.0, None).
+
+    Shared by upload verification and by registration (so content already registered by
+    someone else -- including a screenshot or crop of it -- cannot be registered again
+    under a new owner).
+
+    Fails CLOSED: a problem with one stored record is logged and that record skipped,
+    but if the check itself cannot run the error propagates to the caller instead of
+    quietly reporting "not registered". Previously any exception here returned a clean
+    "not registered", so a single glitch let protected content straight through.
+    """
+    WATERMARK_BITS = 8 * 8  # 8 ASCII chars x 8 bits each
+    is_video = watermark_engine.is_video_file(path)
+    if is_video:
+        extracted_bits = watermark_engine.extract_video_watermark(path, WATERMARK_BITS)
+        # Videos yield more than one candidate hash so records stored under an older
+        # frame convention still compare correctly (see the engine for why).
+        phash_strs = lambda n: watermark_engine.get_video_perceptual_hash_candidates(path, hash_size=n)
+    else:
+        extracted_bits = watermark_engine.extract_watermark(path, WATERMARK_BITS)
+        phash_strs = lambda n: [watermark_engine.get_perceptual_hash(path, hash_size=n)]
+
+    extracted_wid = watermark_engine.binary_to_str(extracted_bits)
+
+    # The upload is hashed at the stored record's size. The earliest records hold a
+    # 64-bit hash (8x8) while current ones hold 256 bits (16x16); comparing across sizes
+    # raised, and the raise skipped the record entirely -- ORB included -- so a copy of
+    # an early registration was only caught if its watermark survived intact.
+    phash_by_size = {}
+    # Featureless uploads (plain colour) have no usable hash; watermark and ORB still run.
+    phash_usable = watermark_engine.perceptual_detail(path) >= watermark_engine.MIN_DETAIL_FOR_PHASH
+
+    def uploaded_phashes_at(hash_size):
+        if hash_size not in phash_by_size:
+            phash_by_size[hash_size] = [watermark_engine.imagehash.hex_to_hash(h) for h in phash_strs(hash_size)]
+        return phash_by_size[hash_size]
+    all_images = db.query(models.ImageRecord).order_by(models.ImageRecord.id).all()
+
+    # Primary: watermark_id exact match (strongest signal) -- the hidden, invisible
+    # DWT-DCT watermark embedded at registration time. Checked against EVERY record
+    # before any fuzzy matching runs. Interleaving it into the per-record scan let a
+    # strong visual match on an older record end the scan before a newer record whose
+    # watermark matched exactly was ever reached -- a block then cited the wrong
+    # registration (its watermark, tx and block) even though the right one existed.
+    exact = next((img for img in all_images if extracted_wid and extracted_wid == img.watermark_id), None)
+    if exact is not None:
+        return exact, 99.9, "watermark"
+
+    # Describe the file once and reuse it for every candidate; this is by far the most
+    # repeated work in the scan. Lazy, so a perceptual-hash hit can settle it without
+    # paying for it. For video this is several frames sampled across the clip.
+    query_orb_features = _Lazy(lambda: watermark_engine.compute_orb_features_multi(
+        watermark_engine.orb_reference_paths(path)))
+
+    # Every record is compared and the strongest evidence wins -- ranked by confidence,
+    # then by how many points actually line up. The scan used to stop at the first
+    # record scoring 97+, oldest first; when the same picture had been registered more
+    # than once, a copy was then cited against whichever registration came first rather
+    # than the one it was actually made from (measured: 317 vs 903 aligned points).
+    matched_image, confidence, match_method, evidence = None, 0.0, None, 0
+    for img in all_images:
+        try:
+            # Secondary: perceptual hash similarity (distance <= 8 of 256 bits, the same
+            # 1/32 tolerance for older 64-bit hashes). Catches near-identical copies
+            # (recompression, minor resize) even if the watermark bits didn't survive.
+            # Its own try: a bad stored hash must never skip the ORB check below.
+            try:
+                if not phash_usable:
+                    raise _SkipLayer
+                db_phash = watermark_engine.imagehash.hex_to_hash(img.image_hash)
+                hash_bits = db_phash.hash.size
+                phash_dist = min(candidate - db_phash
+                                 for candidate in uploaded_phashes_at(db_phash.hash.shape[0]))
+                scaled_dist = phash_dist * 256.0 / hash_bits
+                if scaled_dist <= 8:
+                    phash_conf = max(60.0, 95.0 - scaled_dist * 4)
+                    if (phash_conf, 0) > (confidence, evidence):
+                        matched_image, confidence, match_method, evidence = img, phash_conf, "perceptual_hash", 0
+            except _SkipLayer:
+                pass
+            except Exception:
+                logger.exception("Perceptual hash unusable for registry record %s; using ORB only", img.id)
+
+            # Tertiary: ORB structural matching -- catches screenshots and camera
+            # re-photographs, where watermark and hash are destroyed but the picture's
+            # structure still lines up under a geometrically verified homography (see
+            # orb_similarity_from_features for the gates that keep coincidences out).
+            #
+            # Only the watermarked rendition is compared: it is the copy that circulates
+            # publicly and differs from the original solely by an invisible watermark
+            # (measured: identical scores on every record). The original is only a
+            # fallback for records whose watermarked file is missing.
+            candidate_path = _orb_candidate_path(img)
+            if candidate_path:
+                # A failure here is about the UPLOAD, not this record. Skipping it would
+                # skip every record and report "not registered" -- letting a screenshot
+                # of protected work through. Abort the whole check instead.
+                try:
+                    query_features = query_orb_features.value
+                except Exception as exc:
+                    raise _UploadUnreadable("could not extract features from the upload") from exc
+                candidate_features = watermark_engine.compute_orb_features_multi(
+                    watermark_engine.orb_reference_paths(candidate_path))
+                orb_score, inliers = watermark_engine.best_orb_match(query_features, candidate_features)
+                if orb_score > 0 and (orb_score, inliers) > (confidence, evidence):
+                    matched_image, confidence, match_method, evidence = img, orb_score, "orb_visual_similarity", inliers
+        except _UploadUnreadable:
+            raise
+        except Exception:
+            logger.exception("Skipping registry record %s during match scan", img.id)
+            continue
+
+    if matched_image is None or confidence <= BLOCK_CONFIDENCE:
+        return None, 0.0, None
+    return matched_image, confidence, match_method
+
+
 @app.post("/api/verify-watermark")
 @limiter.limit(config.RATE_LIMIT_VERIFY)
 async def verify_watermark(request: Request, file: UploadFile = File(...), x_registry_internal: str = Header(None), db: Session = Depends(auth.get_db)):
@@ -248,112 +520,20 @@ async def verify_watermark(request: Request, file: UploadFile = File(...), x_reg
     temp_path = os.path.join(UPLOAD_DIR, upload_utils.generate_filename("check", "anon", ext))
     await upload_utils.save_upload_streaming(file, temp_path, config.MAX_UPLOAD_SIZE_BYTES)
 
-    matched_image = None
-    confidence = 0.0
-    match_method = None
-
     try:
-        WATERMARK_BITS = 8 * 8  # 8 ASCII chars × 8 bits each
-        is_video = watermark_engine.is_video_file(temp_path)
-
-        # Step 1: Extract watermark ID
-        if is_video:
-            extracted_bits = watermark_engine.extract_video_watermark(temp_path, WATERMARK_BITS)
-            # Videos yield more than one candidate hash so records stored under an older
-            # frame convention still compare correctly (see the engine for why).
-            uploaded_phash_strs = watermark_engine.get_video_perceptual_hash_candidates(temp_path)
-        else:
-            extracted_bits = watermark_engine.extract_watermark(temp_path, WATERMARK_BITS)
-            uploaded_phash_strs = [watermark_engine.get_perceptual_hash(temp_path)]
-
-        extracted_wid = watermark_engine.binary_to_str(extracted_bits)
-        uploaded_phashes = [watermark_engine.imagehash.hex_to_hash(h) for h in uploaded_phash_strs]
-
-        all_images = db.query(models.ImageRecord).all()
-
-        # Describe the uploaded file once and reuse it for every candidate; this is by
-        # far the most-repeated work in the scan. Computed lazily so a watermark or
-        # perceptual-hash hit can settle the question without paying for it at all. For
-        # video this is several frames sampled across the clip, not one keyframe -- a
-        # single fixed position cannot reliably represent a whole video (see engine).
-        query_orb_features = _Lazy(lambda: watermark_engine.compute_orb_features_multi(
-            watermark_engine.orb_reference_paths(temp_path)))
-
-        for img in all_images:
-            # Primary: watermark_id exact match (strongest signal) -- the hidden,
-            # invisible DWT-DCT watermark embedded at registration time. Survives
-            # re-saves, mild recompression, and exact re-uploads of the watermarked file.
-            if extracted_wid == img.watermark_id:
-                matched_image = img
-                confidence = 99.9
-                match_method = "watermark"
-                break
-
-            # Secondary: perceptual hash similarity (phash distance <= 8 out of 256 bits).
-            # Catches near-identical copies (recompression, minor resize/crop) even if
-            # the watermark bits themselves didn't survive majority-vote extraction.
-            try:
-                db_phash = watermark_engine.imagehash.hex_to_hash(img.image_hash)
-                phash_dist = min(candidate - db_phash for candidate in uploaded_phashes)
-                if phash_dist <= 8:
-                    phash_conf = max(60.0, 95.0 - phash_dist * 4)
-                    if phash_conf > confidence:
-                        matched_image = img
-                        confidence = phash_conf
-                        match_method = "perceptual_hash"
-            except Exception:
-                pass
-
-            # Tertiary: ORB structural feature matching -- this is what catches
-            # screenshots and mobile-camera re-photographs, where both the watermark and
-            # the perceptual hash are destroyed by resampling, perspective distortion and
-            # lighting changes, but the underlying visual structure (edges/corners) still
-            # lines up under a RANSAC homography.
-            #
-            # Only the watermarked rendition is compared: it is the copy that actually
-            # circulates publicly, and it differs from the original solely by an
-            # invisible watermark. Measured across the whole registry, scoring against
-            # the original as well produced identical scores on every record (including
-            # a confirmed real-world match, 100.0 either way) -- it was doubling the
-            # scan for nothing. The original is kept only as a fallback for records
-            # whose watermarked file is missing.
-            candidate_path = _orb_candidate_path(img)
-            if candidate_path:
-                candidate_features = watermark_engine.compute_orb_features_multi(
-                    watermark_engine.orb_reference_paths(candidate_path))
-                orb_score = watermark_engine.best_orb_similarity_from_features(
-                    query_orb_features.value, candidate_features)
-                if orb_score > 25.0 and orb_score > confidence:
-                    matched_image = img
-                    confidence = orb_score
-                    match_method = "orb_visual_similarity"
-
-            if confidence >= ORB_CONFIDENT_ENOUGH:
-                break
-
+        matched_image, confidence, match_method = await run_in_threadpool(_find_registered_match, temp_path, db)
     except Exception:
-        matched_image = None
-        confidence = 0.0
-        match_method = None
+        # Fail closed: the caller refuses the upload rather than treating an unchecked
+        # file as unregistered.
+        logger.exception("Copyright check failed")
+        raise HTTPException(status_code=503, detail="Copyright check could not be completed")
     finally:
-        try:
-            # The upload is a one-off temp file; the ORB sample frames and descriptor
-            # caches written beside it are useless once it's gone (unlike registered
-            # content, which is compared again on future requests and keeps its cache).
-            leftovers = [temp_path, watermark_engine._orb_cache_path(temp_path)]
-            for i in range(len(watermark_engine.VIDEO_ORB_SAMPLE_POSITIONS)):
-                frame = f"{temp_path}_orbkf{i}.jpg"
-                leftovers += [frame, watermark_engine._orb_cache_path(frame)]
-            for path in leftovers:
-                if os.path.exists(path):
-                    os.remove(path)
-        except Exception:
-            pass
+        _cleanup_query_files(temp_path)
 
-    if matched_image and confidence > 50.0:
+    if matched_image:
         owner_id = matched_image.owner_id
         watermark_id = matched_image.watermark_id
-        registered_at = matched_image.timestamp.isoformat()
+        registered_at = utc_iso(matched_image.timestamp)
         owner_source = "registry"
 
         # The chain is the authoritative record of ownership. When it is reachable and
@@ -374,7 +554,7 @@ async def verify_watermark(request: Request, file: UploadFile = File(...), x_reg
                         except (TypeError, ValueError):
                             pass
                     if ts_bc:
-                        registered_at = datetime.utcfromtimestamp(int(ts_bc)).isoformat()
+                        registered_at = datetime.fromtimestamp(int(ts_bc), tz=timezone.utc).isoformat()
             except Exception:
                 blockchain_verified = False
 
@@ -412,7 +592,9 @@ def get_dashboard(current_user: models.User = Depends(auth.get_current_user), db
             "total_network_images": all_images_count,
             "blocks_verified": blocks_verified
         },
-        "images": [{"id": img.id, "watermark_id": img.watermark_id, "tx_hash": img.tx_hash, "timestamp": img.timestamp.isoformat(), "owner_id": img.owner_id} for img in images]
+        # preview_token: thumbnails come with the list instead of one token request per asset.
+        "images": [{"id": img.id, "watermark_id": img.watermark_id, "tx_hash": img.tx_hash, "timestamp": utc_iso(img.timestamp),
+                    "owner_id": img.owner_id, "preview_token": _download_token(current_user, img.id)} for img in images]
     }
 
 @app.post("/api/images/{image_id}/download-token")
@@ -420,12 +602,16 @@ def create_download_token(image_id: int, current_user: models.User = Depends(aut
     img = db.query(models.ImageRecord).filter(models.ImageRecord.id == image_id, models.ImageRecord.owner_id == current_user.id).first()
     if not img:
         raise HTTPException(status_code=404, detail="File not found")
-    token = auth.create_access_token(
-        data={"sub": current_user.username, "user_id": current_user.id, "image_id": image_id},
+    return {"token": _download_token(current_user, image_id), "expires_in": config.DOWNLOAD_TOKEN_EXPIRE_SECONDS}
+
+
+def _download_token(user, image_id):
+    """Short-lived token for one file of the user's, usable in a plain <img>/link URL."""
+    return auth.create_access_token(
+        data={"sub": user.username, "user_id": user.id, "image_id": image_id},
         expires_minutes=config.DOWNLOAD_TOKEN_EXPIRE_SECONDS / 60,
         purpose="download"
     )
-    return {"token": token, "expires_in": config.DOWNLOAD_TOKEN_EXPIRE_SECONDS}
 
 @app.get("/api/images/{image_id}/download")
 def download_image(image_id: int, token: str, db: Session = Depends(auth.get_db)):
@@ -462,15 +648,15 @@ def get_blockchain_blocks():
             txs = []
             for tx in block.transactions:
                 txs.append({
-                    "hash": tx.hash.hex(),
+                    "hash": Web3.to_hex(tx.hash),
                     "from": tx['from'],
                     "to": tx['to'],
                 })
 
             blocks.append({
                 "number": block.number,
-                "hash": block.hash.hex(),
-                "parentHash": block.parentHash.hex(),
+                "hash": Web3.to_hex(block.hash),
+                "parentHash": Web3.to_hex(block.parentHash),
                 "timestamp": block.timestamp,
                 "transactions": txs
             })

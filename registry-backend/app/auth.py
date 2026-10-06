@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import secrets
 import jwt
 import bcrypt
 from fastapi import Depends, HTTPException
@@ -29,7 +30,23 @@ def get_password_hash(password):
     return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
 def verify_password(plain_password, hashed_password):
-    return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    try:
+        return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+    except ValueError:
+        # Stored value isn't a usable bcrypt hash -- treat as "no password set" rather
+        # than letting it surface as a 500 from the login endpoint.
+        return False
+
+
+def unusable_password_hash():
+    """
+    A valid bcrypt hash of unguessable random bytes.
+
+    Used for accounts provisioned on someone's behalf by a trusted service, so the row
+    has a well-formed hash that no password can ever match. Storing a sentinel string
+    instead would make bcrypt raise on every login attempt for that user.
+    """
+    return get_password_hash(secrets.token_urlsafe(32))
 
 def validate_credentials(username: str, password: str):
     if not username or not username.strip():

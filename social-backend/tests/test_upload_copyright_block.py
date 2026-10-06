@@ -127,3 +127,21 @@ def test_upload_persists_with_server_generated_filename(client, auth_headers, te
     feed = client.get("/api/feed", headers=auth_headers["headers"]).json()["posts"]
     assert "evil" not in feed[0]["image_url"]
     assert ".." not in feed[0]["image_url"]
+
+
+def test_owner_alert_names_the_person_who_attempted_the_upload(client, auth_headers, register_user, test_image_bytes, mock_registry):
+    """
+    Regression: the owner's alert said "@<owner> tried to steal your content" -- it named
+    the owner instead of the uploader who was blocked.
+    """
+    owner_u, owner_p = register_user()
+    mock_registry(json_response={"is_registered": True, "owner_name": owner_u, "owner_id": 1,
+                                 "image_id": 7, "tx_hash": "0xdeadbeef", "confidence": 99.0})
+    client.post("/api/posts/upload", headers=auth_headers["headers"],
+                files={"file": ("stolen.png", test_image_bytes, "image/png")})
+
+    owner_tok = client.post("/api/login", data={"username": owner_u, "password": owner_p}).json()["access_token"]
+    alerts = client.get("/api/violations", headers={"Authorization": f"Bearer {owner_tok}"}).json()["notifications"]
+    assert len(alerts) == 1
+    assert alerts[0]["attempted_by_username"] == auth_headers["username"]
+    assert alerts[0]["original_owner_name"] == owner_u
