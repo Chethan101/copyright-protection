@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import axios from 'axios';
+import api from '../api';
 
 export default function Login() {
   const [username, setUsername] = useState('');
@@ -14,7 +14,7 @@ export default function Login() {
       const form = new URLSearchParams();
       form.append('username', username);
       form.append('password', password);
-      const res = await axios.post('http://127.0.0.1:8001/api/login', form);
+      const res = await api.post('/login', form);
       localStorage.setItem('social_token', res.data.access_token);
       localStorage.setItem('social_username', res.data.username);
       localStorage.setItem('social_user_id', String(res.data.user_id));

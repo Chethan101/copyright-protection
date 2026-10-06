@@ -1,7 +1,12 @@
 import { useState, useEffect } from 'react';
-import axios from 'axios';
+import api from '../api';
+import { formatIST, parseServerTime } from '../time';
 
-const API = 'http://127.0.0.1:8001/api';
+const MATCH_METHOD_TAGS: Record<string, string> = {
+  watermark: '🔒 invisible watermark',
+  perceptual_hash: '🔍 perceptual hash',
+  orb_visual_similarity: '📸 screenshot/recapture detection',
+};
 
 export default function Notifications() {
   const [data, setData] = useState<any>(null);
@@ -9,7 +14,7 @@ export default function Notifications() {
   useEffect(() => {
     const fetch = async () => {
       try {
-        const res = await axios.get(`${API}/violations`, { headers: { Authorization: `Bearer ${localStorage.getItem('social_token')}` } });
+        const res = await api.get('/violations');
         setData(res.data);
       } catch { }
     };
@@ -25,7 +30,7 @@ export default function Notifications() {
   const allNotifications = [
     ...data.notifications.map((n: any) => ({ ...n, type: 'alert' })),
     ...data.my_violations.map((v: any) => ({ ...v, type: 'violation' })),
-  ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  ].sort((a, b) => parseServerTime(b.timestamp).getTime() - parseServerTime(a.timestamp).getTime());
 
   return (
     <div style={{ maxWidth: 600, margin: '0 auto' }}>
@@ -56,7 +61,7 @@ export default function Notifications() {
               <div style={{ flex: 1 }}>
                 {n.type === 'alert' ? (
                   <p style={{ fontSize: 14, lineHeight: 1.5 }}>
-                    <strong>Copyright Alert:</strong> User <strong>@{n.original_owner_name || 'unknown'}</strong> tried to steal your registered content.
+                    <strong>Copyright Alert:</strong> User <strong>@{n.attempted_by_username || 'unknown'}</strong> tried to upload your registered content.
                     {n.confidence_score && <span style={{ color: '#ef4444' }}> Detected with {n.confidence_score.toFixed(1)}% confidence.</span>}
                   </p>
                 ) : (
@@ -66,8 +71,13 @@ export default function Notifications() {
                   </p>
                 )}
                 <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
-                  {new Date(n.timestamp).toLocaleString()}
+                  {formatIST(n.timestamp)}
                 </p>
+                {n.match_method && MATCH_METHOD_TAGS[n.match_method] && (
+                  <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+                    Caught via {MATCH_METHOD_TAGS[n.match_method]}
+                  </p>
+                )}
                 {n.tx_hash && (
                   <p style={{ fontSize: 11, color: '#818cf8', fontFamily: 'monospace', marginTop: 4, wordBreak: 'break-all' }}>
                     Tx: {n.tx_hash.substring(0, 40)}...

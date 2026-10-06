@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Env files (real secrets/config; .env.example files stay tracked)
+.env
+.env.*
+!.env.example
+
+# SQLite databases (runtime data, not source)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Node / frontend build output (frontends have their own .gitignore too; belt-and-suspenders)
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# User-uploaded / generated media — runtime data, not source
+registry-backend/app/uploads/*
+registry-backend/app/originals/*
+registry-backend/app/watermarked/*
+social-backend/app/uploads/*
+!registry-backend/app/uploads/.gitkeep
+!registry-backend/app/originals/.gitkeep
+!registry-backend/app/watermarked/.gitkeep
+!social-backend/app/uploads/.gitkeep
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store

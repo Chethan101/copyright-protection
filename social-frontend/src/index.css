@@ -84,14 +84,25 @@ body {
 
 .sidebar-footer { padding: 12px 0 8px; }
 
-/* Main content */
+.logo-short { display: none; }
+.nav-avatar { width: 26px; height: 26px; font-size: 12px; }
+
+/* Main content -- fills the space beside the sidebar; each page is a centred column.
+   The previous version centred via calc(sidebar + (100vw - sidebar - 630px) / 2),
+   which goes negative below ~874px and slid the feed underneath the sidebar. */
 .main-content {
-  margin-left: var(--sidebar-w);
+  --col: 630px;
   flex: 1;
-  max-width: 630px;
+  min-width: 0;
+  margin-left: var(--sidebar-w);
   padding: 0 0 40px;
-  margin-left: calc(var(--sidebar-w) + calc((100vw - var(--sidebar-w) - 630px) / 2));
 }
+.main-content > :first-child { width: 100%; max-width: var(--col); margin-left: auto; margin-right: auto; }
+.main-content.wide { --col: 1100px; }
+.main-content.auth { margin-left: 0; --col: 100%; }
+
+/* Phone-only chrome; hidden on wider screens (see media queries at the end). */
+.mobile-header, .mobile-nav { display: none; }
 
 /* Post card */
 .post-card {
@@ -129,8 +140,9 @@ body {
 
 .post-image {
   width: 100%;
-  max-height: 600px;
-  object-fit: cover;
+  max-height: 750px;
+  object-fit: contain;
+  background: #000;
   display: block;
 }
 
@@ -233,8 +245,14 @@ body {
   border: 1px solid var(--border);
   border-radius: 16px;
   width: 90%; max-width: 500px;
-  overflow: hidden;
+  max-height: 92vh;
+  overflow-y: auto;
 }
+
+/* Upload "add caption" step: preview beside the caption form, stacked on phones. */
+.upload-compose { display: flex; min-height: 320px; }
+.upload-compose-media { width: 260px; flex-shrink: 0; object-fit: cover; border-radius: 0 0 0 16px; background: #000; }
+.upload-compose-form { flex: 1; padding: 16px; display: flex; flex-direction: column; min-width: 0; }
 
 .modal-header {
   display: flex; align-items: center; justify-content: space-between;
@@ -331,11 +349,162 @@ body {
 .like-anim { animation: heartPop 0.3s cubic-bezier(0.17,0.89,0.32,1.49); }
 @keyframes heartPop { 0%{transform:scale(1)} 50%{transform:scale(1.4)} 100%{transform:scale(1)} }
 
-/* Mobile bottom nav */
+/* ── Responsive ───────────────────────────────────────────────────────────── */
+/* Same three tiers Instagram's web app uses: full sidebar on desktop, an icon rail
+   on tablets / small laptops, and top + bottom bars on phones. */
+
+/* Tablet / small laptop: collapse the sidebar to an icon rail. */
+@media (max-width: 1264px) {
+  :root { --sidebar-w: 73px; }
+  .sidebar { padding: 8px 10px; }
+  .sidebar-logo { padding: 20px 0 28px; text-align: center; font-size: 26px; }
+  .logo-full { display: none; }
+  .logo-short { display: inline; }
+  .nav-label { display: none; }
+  .nav-item { justify-content: center; padding: 12px 0; }
+}
+
+/* Phone: drop the sidebar for a top bar and a bottom tab bar. */
 @media (max-width: 768px) {
   .sidebar { display: none; }
-  .main-content { margin-left: 0; max-width: 100vw; }
-  .mobile-nav { display: flex; position: fixed; bottom: 0; left: 0; right: 0; background: var(--bg); border-top: 1px solid var(--border); z-index: 100; justify-content: space-around; padding: 10px 0; }
-  .mobile-nav-btn { background: none; border: none; color: var(--text); cursor: pointer; padding: 8px; display: flex; align-items: center; justify-content: center; }
+  .main-content {
+    margin-left: 0;
+    padding-top: 56px;
+    padding-bottom: calc(64px + env(safe-area-inset-bottom));
+  }
+
+  .mobile-header {
+    display: flex; align-items: center; justify-content: space-between;
+    position: fixed; top: 0; left: 0; right: 0; height: 56px; z-index: 100;
+    padding: 0 8px 0 16px;
+    background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .mobile-logo {
+    font-size: 22px; font-weight: 800; letter-spacing: -0.5px; cursor: pointer;
+    background: linear-gradient(135deg, var(--accent2), var(--accent));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+  }
+  .mobile-header-actions { display: flex; gap: 2px; }
+
+  .mobile-nav {
+    display: flex; justify-content: space-around; align-items: center;
+    position: fixed; bottom: 0; left: 0; right: 0; z-index: 100;
+    padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
+    background: var(--bg); border-top: 1px solid var(--border);
+  }
+  .mobile-nav-btn {
+    background: none; border: none; color: var(--text); cursor: pointer;
+    padding: 10px; display: flex; align-items: center; justify-content: center;
+  }
+  .mobile-nav-btn svg { width: 26px; height: 26px; }
+  .nav-avatar-active { box-shadow: 0 0 0 2px var(--bg), 0 0 0 3.5px var(--text); }
+
+  .post-image { max-height: 80vh; }
+
+  /* Profile header: avatar beside a tighter stats block. */
+  .profile-header { padding: 20px 16px 16px; gap: 20px; }
+  .avatar.xl { width: 72px; height: 72px; font-size: 28px; }
+  .profile-header h2 { font-size: 20px !important; word-break: break-all; }
+  .profile-stats { margin-top: 8px; }
+
+  /* Upload: stack the preview above the caption form. */
+  .modal-box { width: 94%; }
+  .upload-compose { flex-direction: column; min-height: 0; }
+  .upload-compose-media { width: 100%; max-height: 45vh; object-fit: contain; border-radius: 0; }
+  .upload-compose-form { min-height: 200px; }
 }
-@media (min-width: 769px) { .mobile-nav { display: none; } }
+
+/* Small phones. */
+@media (max-width: 420px) {
+  .auth-card { padding: 28px 20px 20px; }
+  .auth-logo { font-size: 34px; margin-bottom: 24px; }
+  .auth-box { padding: 0 12px; }
+  .stories-bar { gap: 12px; padding: 12px; }
+  .post-header { padding: 12px; }
+  .profile-header { gap: 14px; }
+  .avatar.xl { width: 60px; height: 60px; font-size: 24px; }
+}
+
+/* ── Copyright Registry tab ───────────────────────────────────────────────── */
+/* The registry portal came from the standalone CopyGuard app and is written in
+   Tailwind utility classes, while the rest of VibeSocial is hand-written CSS.
+   `@tailwind base` is deliberately NOT emitted: Preflight's global element resets
+   would flatten the feed's own styling.
+
+   What that base layer provides, the registry still needs -- both halves are
+   reproduced here, scoped to the registry subtree:
+     * the `--tw-*` custom-property defaults utilities compose from. Without them a
+       rule like `from-teal-500` expands to `#14b8a6 var(--tw-gradient-from-position)`,
+       which is invalid and dropped outright -- silently flattening every gradient,
+       shadow and blur;
+     * the few element resets utilities assume (borders need a style to paint, etc).
+
+   Order and specificity matter. Real Preflight sits BEFORE utilities, so any utility
+   overrides it. An earlier version put this block after `@tailwind utilities` and
+   used plain class selectors, so `border-width: 0` beat every `border` class and
+   `background-image: none` beat `bg-gradient-to-r` -- the registry's inputs lost
+   their borders and its buttons their gradients. Everything below is wrapped in
+   `:where()` (zero specificity) and placed before the utilities, matching Preflight. */
+:where(.registry-scope, .registry-scope *, .registry-scope *::before, .registry-scope *::after) {
+  border-width: 0;
+  border-style: solid;
+  border-color: #374151;
+
+  --tw-translate-x: 0;
+  --tw-translate-y: 0;
+  --tw-rotate: 0;
+  --tw-skew-x: 0;
+  --tw-skew-y: 0;
+  --tw-scale-x: 1;
+  --tw-scale-y: 1;
+  --tw-gradient-from-position: ;
+  --tw-gradient-via-position: ;
+  --tw-gradient-to-position: ;
+  --tw-ring-inset: ;
+  --tw-ring-offset-width: 0px;
+  --tw-ring-offset-color: #fff;
+  --tw-ring-color: rgb(59 130 246 / 0.5);
+  --tw-ring-offset-shadow: 0 0 #0000;
+  --tw-ring-shadow: 0 0 #0000;
+  --tw-shadow: 0 0 #0000;
+  --tw-shadow-colored: 0 0 #0000;
+  --tw-blur: ;
+  --tw-brightness: ;
+  --tw-contrast: ;
+  --tw-grayscale: ;
+  --tw-hue-rotate: ;
+  --tw-invert: ;
+  --tw-saturate: ;
+  --tw-sepia: ;
+  --tw-drop-shadow: ;
+  --tw-backdrop-blur: ;
+  --tw-backdrop-brightness: ;
+  --tw-backdrop-contrast: ;
+  --tw-backdrop-grayscale: ;
+  --tw-backdrop-hue-rotate: ;
+  --tw-backdrop-invert: ;
+  --tw-backdrop-opacity: ;
+  --tw-backdrop-saturate: ;
+  --tw-backdrop-sepia: ;
+}
+
+:where(.registry-scope) :where(button) {
+  background-color: transparent;
+  background-image: none;
+  font-family: inherit;
+  font-size: 100%;
+  color: inherit;
+}
+:where(.registry-scope) :where(input) { font-family: inherit; font-size: 100%; color: inherit; }
+:where(.registry-scope) :where(table) { border-collapse: collapse; }
+:where(.registry-scope) :where(img, video) { display: block; max-width: 100%; }
+
+@tailwind utilities;
+
+.glass {
+  background-color: rgb(31 41 55 / 0.6);
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgb(55 65 81 / 0.5);
+  box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1);
+}

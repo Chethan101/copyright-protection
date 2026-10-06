@@ -1,5 +1,6 @@
 import { useState, useRef } from 'react';
-import axios from 'axios';
+import api from '../api';
+import { API_BASE_URL } from '../config';
 import { Upload, CheckCircle2, Copy, Shield, Download } from 'lucide-react';
 
 export default function RegisterCopyright() {
@@ -36,23 +37,11 @@ export default function RegisterCopyright() {
     setLoading(true);
     setError('');
     try {
-      const token = localStorage.getItem('registry_token');
-      if (!token) {
-        window.location.href = '/login';
-        return;
-      }
       const formData = new FormData();
       formData.append('file', file);
-      const res = await axios.post('http://127.0.0.1:8000/api/images/register', formData, {
-        headers: { 'Authorization': `Bearer ${token}` }
-      });
+      const res = await api.post('/images/register', formData);
       setResult(res.data);
     } catch (err: any) {
-      if (err.response?.status === 401) {
-        localStorage.removeItem('registry_token');
-        window.location.href = '/login';
-        return;
-      }
       setError(err.response?.data?.detail || 'Registration failed. Please try again.');
     } finally {
       setLoading(false);
@@ -63,15 +52,23 @@ export default function RegisterCopyright() {
     navigator.clipboard.writeText(text);
   };
 
-  const handleDownload = () => {
-    const token = localStorage.getItem('registry_token');
-    const url = `http://127.0.0.1:8000/api/images/${result.image_id}/download?token=${token}`;
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `watermarked_${result.watermark_id}.jpg`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  const isVideo = file?.type.startsWith('video/') ?? false;
+
+  const handleDownload = async () => {
+    try {
+      const tokenRes = await api.post(`/images/${result.image_id}/download-token`);
+      const url = `${API_BASE_URL}/api/images/${result.image_id}/download?token=${tokenRes.data.token}`;
+      const a = document.createElement('a');
+      a.href = url;
+      // The registry always hands back watermarked videos as MP4 (browser-playable
+      // H.264), regardless of the container the original file was uploaded in.
+      a.download = `watermarked_${result.watermark_id}.${isVideo ? 'mp4' : 'jpg'}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch {
+      setError('Could not start download. Please try again.');
+    }
   };
 
   return (
@@ -134,11 +131,10 @@ export default function RegisterCopyright() {
 
           {result && (
             <button
-              onClick={handleSubmit.bind(null)}
-              className="w-full py-3 rounded-xl font-medium border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white transition-all"
               onClick={() => { setResult(null); setFile(null); setPreview(''); setError(''); }}
+              className="w-full py-3 rounded-xl font-medium border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-white transition-all"
             >
-              Register Another Image
+              Register Another Asset
             </button>
           )}
         </div>
@@ -173,7 +169,7 @@ export default function RegisterCopyright() {
                 </div>
 
                 <div>
-                  <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Image Hash (SHA-256)</label>
+                  <label className="text-xs font-semibold text-gray-400 uppercase tracking-wider">Content Hash</label>
                   <code className="block bg-gray-900/80 px-3 py-2 rounded text-gray-300 font-mono text-xs mt-1 truncate">{result.image_hash}</code>
                 </div>
 
@@ -194,16 +190,16 @@ export default function RegisterCopyright() {
                   className="w-full py-4 rounded-xl font-bold bg-gradient-to-r from-green-500 to-teal-500 hover:from-green-400 hover:to-teal-400 text-white transition-all shadow-lg shadow-green-500/25 flex items-center justify-center gap-3 text-lg"
                 >
                   <Download className="w-5 h-5" />
-                  Download Watermarked Image
+                  Download Watermarked {isVideo ? 'Video' : 'Image'}
                 </button>
-                <p className="text-xs text-center text-gray-500">Use this watermarked image when posting on social media. Any unauthorized use will be detected.</p>
+                <p className="text-xs text-center text-gray-500">Use this watermarked {isVideo ? 'video' : 'image'} when posting on social media. Any unauthorized use will be detected.</p>
               </div>
             </div>
           ) : (
             <div className="glass p-8 rounded-2xl h-full flex flex-col items-center justify-center text-center text-gray-500 border-dashed border-2 border-gray-700/50">
               <Shield className="w-16 h-16 mb-4 text-gray-700" />
               <h3 className="text-lg font-medium text-gray-400 mb-2">Immutable Protection</h3>
-              <p className="text-sm">When you register an image, we extract its unique features, generate a perceptual hash, embed an invisible DWT-DCT watermark, and register the metadata on the Ganache blockchain.</p>
+              <p className="text-sm">When you register an image or video, we extract its unique features, generate a perceptual hash, embed an invisible DWT-DCT watermark, and register the metadata on the Ganache blockchain.</p>
             </div>
           )}
         </div>

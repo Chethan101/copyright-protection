@@ -1,31 +1,75 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from .database import engine, SessionLocal, Base
-from . import models, auth
-import os, uuid, shutil, requests
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
+from .database import engine, Base
+from . import models, auth, upload_utils, config
+import os, uuid, requests
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from datetime import timezone
 
 Base.metadata.create_all(bind=engine)
 
+if engine.dialect.name == "sqlite":
+    # No migration framework in this project; additive SQLite columns are cheap
+    # and safe to backfill here so pre-existing DBs pick up new model fields.
+    with engine.connect() as conn:
+        existing_cols = {row[1] for row in conn.execute(text("PRAGMA table_info(violation_logs)"))}
+        if existing_cols and "match_method" not in existing_cols:
+            conn.execute(text("ALTER TABLE violation_logs ADD COLUMN match_method VARCHAR"))
+            conn.commit()
+
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), 'uploads')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-REGISTRY_URL = "http://127.0.0.1:8000/api"
+REGISTRY_URL = config.REGISTRY_URL
+
+
+def utc_iso(dt):
+    """
+    Serialize a stored timestamp as explicit UTC (e.g. ...+00:00).
+
+    Timestamps are stored as naive UTC (datetime.utcnow). Sent without an offset, a
+    browser reads them as LOCAL time -- in India every post then appeared 5h30m older
+    than it was ("5h ago" for something just posted).
+    """
+    if dt is None:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/register")
 def register(username: str = Form(...), password: str = Form(...), db: Session = Depends(auth.get_db)):
+    auth.validate_credentials(username, password)
+    username = username.strip()
     if db.query(models.User).filter(models.User.username == username).first():
         raise HTTPException(status_code=400, detail="Username already registered")
     user = models.User(username=username, password_hash=auth.get_password_hash(password))
-    db.add(user); db.commit()
+    db.add(user)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Username already registered")
     return {"msg": "Registered successfully"}
 
 @app.post("/api/login")
@@ -36,45 +80,90 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     token = auth.create_access_token(data={"sub": user.username, "user_id": user.id})
     return {"access_token": token, "token_type": "bearer", "username": user.username, "user_id": user.id}
 
+# ── Copyright registry session ────────────────────────────────────────────────
+
+@app.post("/api/registry/session")
+def registry_session(current_user: models.User = Depends(auth.get_current_user)):
+    """
+    Hand the Registry tab a registry session for the signed-in VibeSocial user.
+
+    The registry is a separate service with its own signing key, and the two backends
+    reject each other's tokens on purpose -- so rather than sharing a key, this vouches
+    for the already-authenticated user over the internal channel the copyright check
+    already uses, and passes back the registry's own token.
+
+    The registry account is provisioned under the same username, which is what makes a
+    creator the owner of what they register: ownership is attributed by username across
+    the two services, so posting your own registered work is recognised as yours.
+    """
+    try:
+        resp = requests.post(
+            f"{REGISTRY_URL}/internal/session",
+            data={"username": current_user.username},
+            headers={"x-registry-internal": config.INTERNAL_API_KEY},
+            timeout=config.REGISTRY_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        raise HTTPException(status_code=503, detail="The registry service is not reachable right now.")
+    if resp.status_code == 409:
+        # A registry-only account already holds this username; the registry refuses to
+        # hand it over (it may belong to someone else). Pass the explanation through.
+        raise HTTPException(status_code=409, detail=resp.json().get("detail", "Registry account conflict"))
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=503, detail="The registry service is not reachable right now.")
+    return resp.json()
+
+
 # ── Posts ─────────────────────────────────────────────────────────────────────
 
 def _post_dict(p: models.Post, db: Session, current_user_id: int = None):
     uploader = db.query(models.User).filter(models.User.id == p.uploader_id).first()
     liked = False
+    saved = False
     if current_user_id:
         liked = db.query(models.Like).filter(models.Like.post_id == p.id, models.Like.user_id == current_user_id).first() is not None
+        saved = db.query(models.SavedPost).filter(models.SavedPost.post_id == p.id, models.SavedPost.user_id == current_user_id).first() is not None
     comments = []
     for c in sorted(p.comments, key=lambda x: x.timestamp):
         commenter = db.query(models.User).filter(models.User.id == c.user_id).first()
-        comments.append({"id": c.id, "username": commenter.username if commenter else "?", "text": c.text, "timestamp": c.timestamp.isoformat()})
+        comments.append({"id": c.id, "user_id": c.user_id, "username": commenter.username if commenter else "?", "text": c.text, "timestamp": utc_iso(c.timestamp)})
     return {
         "id": p.id,
         "uploader": uploader.username if uploader else "Unknown",
         "uploader_id": p.uploader_id,
-        "image_url": f"http://localhost:8001/api/images/{p.image_path}",
+        "image_url": f"/api/images/{p.image_path}",
         "caption": p.caption or "",
-        "timestamp": p.timestamp.isoformat(),
+        "timestamp": utc_iso(p.timestamp),
         "likes_count": len(p.likes),
         "liked": liked,
+        "saved": saved,
         "comments": comments,
         "comments_count": len(p.comments),
         "repost_of": p.repost_of,
+        "is_owner": current_user_id == p.uploader_id,
     }
 
 @app.post("/api/posts/upload")
+@limiter.limit(config.RATE_LIMIT_UPLOAD)
 async def upload_post(
+    request: Request,
     file: UploadFile = File(...),
     caption: str = Form(default=""),
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(auth.get_db)
 ):
-    temp_path = os.path.join(UPLOAD_DIR, f"check_{uuid.uuid4().hex[:8]}_{file.filename}")
-    with open(temp_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    ext = upload_utils.validate_extension(file.filename)
+    temp_path = os.path.join(UPLOAD_DIR, upload_utils.generate_filename("check", current_user.id, ext))
+    await upload_utils.save_upload_streaming(file, temp_path, config.MAX_UPLOAD_SIZE_BYTES)
 
     try:
         with open(temp_path, "rb") as f:
-            resp = requests.post(f"{REGISTRY_URL}/verify-watermark", files={"file": (file.filename, f, file.content_type)}, timeout=15)
+            resp = requests.post(
+                f"{REGISTRY_URL}/verify-watermark",
+                files={"file": (file.filename, f, file.content_type)},
+                headers={"x-registry-internal": config.INTERNAL_API_KEY},
+                timeout=config.REGISTRY_TIMEOUT_SECONDS
+            )
             resp.raise_for_status()
             verification_result = resp.json()
     except Exception as e:
@@ -89,6 +178,7 @@ async def upload_post(
             image_id=str(verification_result.get("image_id")),
             tx_hash=verification_result.get("tx_hash"),
             confidence_score=verification_result.get("confidence"),
+            match_method=verification_result.get("match_method"),
             reason="Unauthorized Upload Attempt"
         )
         db.add(log); db.commit()
@@ -97,12 +187,16 @@ async def upload_post(
             "message": "Copyright Protected Content",
             "owner_name": verification_result.get("owner_name"),
             "owner_id": verification_result.get("owner_id"),
+            "owner_source": verification_result.get("owner_source"),
+            "watermark_id": verification_result.get("watermark_id"),
             "tx_id": verification_result.get("tx_hash"),
             "timestamp": verification_result.get("timestamp"),
-            "confidence": verification_result.get("confidence")
+            "confidence": verification_result.get("confidence"),
+            "match_method": verification_result.get("match_method"),
+            "blockchain_verified": verification_result.get("blockchain_verified")
         })
 
-    post_filename = f"post_{current_user.id}_{uuid.uuid4().hex[:8]}_{file.filename}"
+    post_filename = upload_utils.generate_filename("post", current_user.id, ext)
     os.rename(temp_path, os.path.join(UPLOAD_DIR, post_filename))
     new_post = models.Post(uploader_id=current_user.id, image_path=post_filename, caption=caption)
     db.add(new_post); db.commit(); db.refresh(new_post)
@@ -112,6 +206,33 @@ async def upload_post(
 def get_feed(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
     posts = db.query(models.Post).order_by(models.Post.timestamp.desc()).all()
     return {"posts": [_post_dict(p, db, current_user.id) for p in posts]}
+
+@app.delete("/api/posts/{post_id}")
+def delete_post(post_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.uploader_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own posts")
+
+    image_path = post.image_path
+    # Reposts of this post copy its file reference rather than owning a separate upload
+    # (see /posts/{id}/repost). Detach them into standalone posts instead of leaving a
+    # dangling repost_of, matching how reposts behave on real platforms when the
+    # original is removed -- the repost itself is not deleted.
+    db.query(models.Post).filter(models.Post.repost_of == post_id).update({"repost_of": None})
+    db.delete(post)  # cascades likes/comments/saves via the model relationships
+    db.commit()
+
+    # Only remove the file if no other post (a repost, or this same file reposted
+    # again) still references it.
+    still_referenced = db.query(models.Post).filter(models.Post.image_path == image_path).first()
+    if not still_referenced:
+        file_path = upload_utils.safe_join(UPLOAD_DIR, image_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    return {"msg": "Post deleted"}
 
 @app.get("/api/profile/{username}")
 def get_profile(username: str, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
@@ -138,8 +259,38 @@ def toggle_like(post_id: int, current_user: models.User = Depends(auth.get_curre
         return {"liked": False, "likes_count": db.query(models.Like).filter(models.Like.post_id == post_id).count()}
     else:
         like = models.Like(user_id=current_user.id, post_id=post_id)
-        db.add(like); db.commit()
+        db.add(like)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()  # Already liked concurrently — idempotent, treat as success
         return {"liked": True, "likes_count": db.query(models.Like).filter(models.Like.post_id == post_id).count()}
+
+# ── Saves / Bookmarks ─────────────────────────────────────────────────────────
+
+@app.post("/api/posts/{post_id}/save")
+def toggle_save(post_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
+    post = db.query(models.Post).filter(models.Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    existing = db.query(models.SavedPost).filter(models.SavedPost.post_id == post_id, models.SavedPost.user_id == current_user.id).first()
+    if existing:
+        db.delete(existing); db.commit()
+        return {"saved": False}
+    else:
+        save = models.SavedPost(user_id=current_user.id, post_id=post_id)
+        db.add(save)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()  # Already saved concurrently -- idempotent, treat as success
+        return {"saved": True}
+
+@app.get("/api/saved")
+def get_saved(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
+    saves = db.query(models.SavedPost).filter(models.SavedPost.user_id == current_user.id).order_by(models.SavedPost.timestamp.desc()).all()
+    posts = [s.post for s in saves if s.post is not None]
+    return {"posts": [_post_dict(p, db, current_user.id) for p in posts]}
 
 # ── Comments ──────────────────────────────────────────────────────────────────
 
@@ -155,7 +306,7 @@ def add_comment(post_id: int, body: CommentBody, current_user: models.User = Dep
         raise HTTPException(status_code=400, detail="Comment cannot be empty")
     comment = models.Comment(user_id=current_user.id, post_id=post_id, text=body.text.strip())
     db.add(comment); db.commit(); db.refresh(comment)
-    return {"id": comment.id, "username": current_user.username, "text": comment.text, "timestamp": comment.timestamp.isoformat()}
+    return {"id": comment.id, "username": current_user.username, "text": comment.text, "timestamp": utc_iso(comment.timestamp)}
 
 @app.delete("/api/comments/{comment_id}")
 def delete_comment(comment_id: int, current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
@@ -187,18 +338,22 @@ def repost(post_id: int, current_user: models.User = Depends(auth.get_current_us
 @app.get("/api/violations")
 def get_violations(current_user: models.User = Depends(auth.get_current_user), db: Session = Depends(auth.get_db)):
     violations = db.query(models.ViolationLog).filter(models.ViolationLog.attempted_by_id == current_user.id).order_by(models.ViolationLog.timestamp.desc()).all()
-    alerts = db.query(models.ViolationLog).filter(models.ViolationLog.original_owner_id == current_user.id).order_by(models.ViolationLog.timestamp.desc()).all()
+    # original_owner_id is registry-backend's user id, from registry's own independent
+    # users table -- it has no relationship to this service's ids and must never be
+    # compared against current_user.id here. original_owner_name (a plain username
+    # string) is the only field both services agree on; match on that instead.
+    alerts = db.query(models.ViolationLog).filter(models.ViolationLog.original_owner_name == current_user.username).order_by(models.ViolationLog.timestamp.desc()).all()
+    usernames = {u.id: u.username for u in db.query(models.User).filter(
+        models.User.id.in_({v.attempted_by_id for v in violations + alerts})).all()}
     def v_dict(v):
-        return {"id": v.id, "attempted_by_id": v.attempted_by_id, "original_owner_name": v.original_owner_name, "tx_hash": v.tx_hash, "confidence_score": v.confidence_score, "reason": v.reason, "timestamp": v.timestamp.isoformat()}
+        return {"id": v.id, "attempted_by_id": v.attempted_by_id, "attempted_by_username": usernames.get(v.attempted_by_id), "original_owner_name": v.original_owner_name, "tx_hash": v.tx_hash, "confidence_score": v.confidence_score, "match_method": v.match_method, "reason": v.reason, "timestamp": utc_iso(v.timestamp)}
     return {"my_violations": [v_dict(v) for v in violations], "notifications": [v_dict(v) for v in alerts]}
 
 # ── Static images ─────────────────────────────────────────────────────────────
 
 @app.get("/api/images/{image_name}")
 def serve_image(image_name: str):
-    file_path = os.path.join(UPLOAD_DIR, image_name)
+    file_path = upload_utils.safe_join(UPLOAD_DIR, image_name)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
-    ext = os.path.splitext(image_name)[1].lower()
-    media_type = "video/mp4" if ext in ['.mp4', '.mov', '.webm', '.avi', '.mkv'] else "image/jpeg"
-    return FileResponse(file_path, media_type=media_type)
+    return FileResponse(file_path, media_type=upload_utils.media_type_for(file_path))

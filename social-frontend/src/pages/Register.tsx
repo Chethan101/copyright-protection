@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import axios from 'axios';
+import api from '../api';
 
 export default function Register() {
   const [username, setUsername] = useState('');
@@ -14,12 +14,12 @@ export default function Register() {
       const form = new FormData();
       form.append('username', username);
       form.append('password', password);
-      await axios.post('http://127.0.0.1:8001/api/register', form);
+      await api.post('/register', form);
       // Auto-login after register
       const loginForm = new URLSearchParams();
       loginForm.append('username', username);
       loginForm.append('password', password);
-      const res = await axios.post('http://127.0.0.1:8001/api/login', loginForm);
+      const res = await api.post('/login', loginForm);
       localStorage.setItem('social_token', res.data.access_token);
       localStorage.setItem('social_username', res.data.username);
       localStorage.setItem('social_user_id', String(res.data.user_id));

@@ -19,11 +19,11 @@ class Post(Base):
     image_path = Column(String, nullable=False)
     caption = Column(Text, default="")
     timestamp = Column(DateTime, default=datetime.utcnow)
-    is_verified = Column(Integer, default=1)
     repost_of = Column(Integer, ForeignKey("posts.id"), nullable=True)
     uploader = relationship("User", back_populates="posts", foreign_keys=[uploader_id])
     likes = relationship("Like", back_populates="post", cascade="all, delete-orphan")
     comments = relationship("Comment", back_populates="post", cascade="all, delete-orphan")
+    saves = relationship("SavedPost", back_populates="post", cascade="all, delete-orphan")
 
 class Like(Base):
     __tablename__ = "likes"
@@ -45,6 +45,16 @@ class Comment(Base):
     post = relationship("Post", back_populates="comments")
     user = relationship("User")
 
+class SavedPost(Base):
+    __tablename__ = "saved_posts"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    post_id = Column(Integer, ForeignKey("posts.id"), nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "post_id", name="unique_save"),)
+    post = relationship("Post", back_populates="saves")
+    user = relationship("User")
+
 class ViolationLog(Base):
     __tablename__ = "violation_logs"
     id = Column(Integer, primary_key=True, index=True)
@@ -54,6 +64,7 @@ class ViolationLog(Base):
     image_id = Column(String, nullable=True)
     tx_hash = Column(String, nullable=True)
     confidence_score = Column(Float, nullable=True)
+    match_method = Column(String, nullable=True)
     reason = Column(String, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
     attempted_by = relationship("User")

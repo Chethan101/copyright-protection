@@ -8,6 +8,10 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
+    # Who created the account. VibeSocial's sign-on may only ever log into accounts it
+    # created itself ("social"): matching on the username alone let anyone sign up a
+    # lookalike account on the registry and receive another person's registrations.
+    origin = Column(String, nullable=False, default="registry", server_default="registry")
     images = relationship("ImageRecord", back_populates="owner")
 
 class ImageRecord(Base):

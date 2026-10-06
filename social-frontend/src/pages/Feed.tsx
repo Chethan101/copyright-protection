@@ -1,19 +1,66 @@
 import { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
+import api from '../api';
+import { API_BASE_URL } from '../config';
+import { timeAgo, formatIST } from '../time';
 
-const API = 'http://127.0.0.1:8001/api';
-const token = () => localStorage.getItem('social_token');
 const myUsername = () => localStorage.getItem('social_username') || '';
 
-function timeAgo(iso: string) {
-  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (diff < 60) return `${Math.floor(diff)}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
+function PostMenu({ post, onDelete }: any) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', close);
+    return () => document.removeEventListener('mousedown', close);
+  }, [open]);
+
+  const handleDelete = () => {
+    setOpen(false);
+    if (window.confirm('Delete this post? This can\'t be undone.')) {
+      onDelete(post.id);
+    }
+  };
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <button
+        style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text)', fontSize: 20, padding: '0 4px' }}
+        onClick={() => setOpen(o => !o)}
+      >
+        •••
+      </button>
+      {open && (
+        <div style={{
+          position: 'absolute', right: 0, top: '100%', zIndex: 10,
+          background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 10,
+          minWidth: 160, boxShadow: '0 8px 24px rgba(0,0,0,0.3)', overflow: 'hidden',
+        }}>
+          {post.is_owner ? (
+            <button
+              onClick={handleDelete}
+              style={{ display: 'block', width: '100%', textAlign: 'left', padding: '12px 16px', background: 'none', border: 'none', color: '#ef4444', fontWeight: 700, fontSize: 14, cursor: 'pointer' }}
+            >
+              Delete
+            </button>
+          ) : (
+            <button
+              onClick={() => setOpen(false)}
+              style={{ display: 'block', width: '100%', textAlign: 'left', padding: '12px 16px', background: 'none', border: 'none', color: 'var(--text)', fontSize: 14, cursor: 'pointer' }}
+            >
+              Cancel
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
 
-function PostCard({ post, onLike, onComment, onRepost }: any) {
+function PostCard({ post, onLike, onComment, onRepost, onSave, onDelete }: any) {
   const [showAllComments, setShowAllComments] = useState(false);
   const [commentText, setCommentText] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -21,6 +68,7 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
   const [localLiked, setLocalLiked] = useState(post.liked);
   const [localLikes, setLocalLikes] = useState(post.likes_count);
   const [localComments, setLocalComments] = useState(post.comments);
+  const [localSaved, setLocalSaved] = useState(post.saved);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleLike = async () => {
@@ -29,6 +77,11 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
     setLocalLiked(!localLiked);
     setLocalLikes((n: number) => localLiked ? n - 1 : n + 1);
     await onLike(post.id);
+  };
+
+  const handleSave = async () => {
+    setLocalSaved(!localSaved);
+    await onSave(post.id);
   };
 
   const handleComment = async (e: React.FormEvent) => {
@@ -60,14 +113,14 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
             {post.repost_of && <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Reposted</div>}
           </div>
         </a>
-        <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text)', fontSize: 20, padding: '0 4px' }}>•••</button>
+        <PostMenu post={post} onDelete={onDelete} />
       </div>
 
       {/* Media: Image or Video */}
       {['.mp4', '.mov', '.webm', '.avi', '.mkv'].some(ext => post.image_url.toLowerCase().endsWith(ext)) ? (
-        <video src={post.image_url} controls loop muted className="post-image" />
+        <video src={`${API_BASE_URL}${post.image_url}`} controls loop muted className="post-image" />
       ) : (
-        <img src={post.image_url} alt="post" className="post-image" />
+        <img src={`${API_BASE_URL}${post.image_url}`} alt="post" className="post-image" />
       )}
 
       {/* Action buttons */}
@@ -93,8 +146,8 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
           </svg>
         </button>
 
-        <button className="action-btn save-btn">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+        <button className="action-btn save-btn" onClick={handleSave} title={localSaved ? 'Remove from saved' : 'Save'}>
+          <svg viewBox="0 0 24 24" fill={localSaved ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="2">
             <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
           </svg>
         </button>
@@ -125,14 +178,14 @@ function PostCard({ post, onLike, onComment, onRepost }: any) {
             <div>
               <strong>{c.username}</strong>
               {c.text}
-              <div className="comment-time">{timeAgo(c.timestamp)}</div>
+              <div className="comment-time" title={formatIST(c.timestamp)}>{timeAgo(c.timestamp)}</div>
             </div>
           </div>
         ))}
       </div>
 
       {/* Timestamp */}
-      <div className="post-time">{timeAgo(post.timestamp)}</div>
+      <div className="post-time" title={formatIST(post.timestamp)}>{timeAgo(post.timestamp)}</div>
 
       {/* Comment input */}
       <form className="comment-input-row" onSubmit={handleComment}>
@@ -177,10 +230,10 @@ export default function Feed({ onOpenUpload }: { onOpenUpload: () => void }) {
 
   const fetchFeed = async () => {
     try {
-      const res = await axios.get(`${API}/feed`, { headers: { Authorization: `Bearer ${token()}` } });
+      const res = await api.get('/feed');
       setPosts(res.data.posts);
-    } catch (err: any) {
-      if (err.response?.status === 401) window.location.href = '/login';
+    } catch {
+      // 401s are already handled globally by the api client's response interceptor.
     } finally {
       setLoading(false);
     }
@@ -189,22 +242,35 @@ export default function Feed({ onOpenUpload }: { onOpenUpload: () => void }) {
   useEffect(() => { fetchFeed(); }, []);
 
   const handleLike = async (postId: number) => {
-    await axios.post(`${API}/posts/${postId}/like`, {}, { headers: { Authorization: `Bearer ${token()}` } });
+    await api.post(`/posts/${postId}/like`, {});
   };
 
   const handleComment = async (postId: number, text: string) => {
     try {
-      const res = await axios.post(`${API}/posts/${postId}/comment`, { text }, { headers: { Authorization: `Bearer ${token()}` } });
+      const res = await api.post(`/posts/${postId}/comment`, { text });
       return res.data;
     } catch { return null; }
   };
 
   const handleRepost = async (postId: number) => {
     try {
-      await axios.post(`${API}/posts/${postId}/repost`, {}, { headers: { Authorization: `Bearer ${token()}` } });
+      await api.post(`/posts/${postId}/repost`, {});
       fetchFeed();
     } catch (err: any) {
       if (err.response?.data?.detail === 'Already reposted') alert('You already reposted this!');
+    }
+  };
+
+  const handleSave = async (postId: number) => {
+    await api.post(`/posts/${postId}/save`, {});
+  };
+
+  const handleDelete = async (postId: number) => {
+    try {
+      await api.delete(`/posts/${postId}`);
+      setPosts(prev => prev.filter(p => p.id !== postId));
+    } catch {
+      alert('Failed to delete post');
     }
   };
 
@@ -237,6 +303,8 @@ export default function Feed({ onOpenUpload }: { onOpenUpload: () => void }) {
           onLike={handleLike}
           onComment={handleComment}
           onRepost={handleRepost}
+          onSave={handleSave}
+          onDelete={handleDelete}
         />
       ))}
     </div>
