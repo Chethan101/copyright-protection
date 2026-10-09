@@ -594,7 +594,8 @@ def get_dashboard(current_user: models.User = Depends(auth.get_current_user), db
         },
         # preview_token: thumbnails come with the list instead of one token request per asset.
         "images": [{"id": img.id, "watermark_id": img.watermark_id, "tx_hash": img.tx_hash, "timestamp": utc_iso(img.timestamp),
-                    "owner_id": img.owner_id, "preview_token": _download_token(current_user, img.id)} for img in images]
+                    "owner_id": img.owner_id, "preview_token": _download_token(current_user, img.id),
+                    "is_video": watermark_engine.is_video_file(img.watermarked_path or "")} for img in images]
     }
 
 @app.post("/api/images/{image_id}/download-token")

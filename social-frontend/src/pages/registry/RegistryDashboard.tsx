@@ -104,7 +104,17 @@ export default function RegistryDashboard({ onNavigate }: { onNavigate: (view: s
                 {data.images.map((img: any) => (
                   <tr key={img.id} className="hover:bg-gray-800/30 transition-colors">
                     <td className="py-4">
-                      {img.preview_token ? (
+                      {img.preview_token && img.is_video ? (
+                        // Watermarked videos are MP4; an <img> can't show them. Load only
+                        // the metadata so the first frame appears without downloading the clip.
+                        <video
+                          src={`${REGISTRY_BASE_URL}/api/images/${img.id}/download?token=${img.preview_token}#t=0.5`}
+                          muted
+                          playsInline
+                          preload="metadata"
+                          className="w-16 h-16 object-cover rounded-lg border border-gray-700 bg-black"
+                        />
+                      ) : img.preview_token ? (
                         <img
                           src={`${REGISTRY_BASE_URL}/api/images/${img.id}/download?token=${img.preview_token}`}
                           alt="preview"
